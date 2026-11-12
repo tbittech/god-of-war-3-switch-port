@@ -1,100 +1,93 @@
-<h1 align=center>God of War III — port para Nintendo Switch</h1>
+<h1 align=center>God of War III — native Nintendo Switch port</h1>
 
-Port nativo **en desarrollo** de **God of War III** (PS3, 2010) para **Nintendo Switch** con homebrew (Atmosphère). Se hace por **recompilación estática**: el código PPU y SPU del `EBOOT.BIN` de PS3 se traduce por adelantado a C/C++, se compila con devkitA64/libnx y sale un `.nro` para homebrew. No es un emulador ni usa JIT.
+**English** | [Español](README.es.md)
 
-> **Este repositorio no contiene el juego ni código derivado de él.** No hay EBOOT, PSARC, videos, audio, ni el código PPU/SPU generado por el lifter. Para usarlo hay que tener un dump propio del disco (BCUS-98111 v1.00).
+A native Nintendo Switch port of the PS3 version of **God of War III** (BCUS-98111).
 
-**Estado:** arranca en consola, reproduce el video de intro y muestra la pantalla de calibración de brillo con los shaders del juego. **Todavía no es jugable.**
+It is not an emulator. The PPU (PowerPC) and SPU code in the game's `EBOOT.BIN` is statically recompiled to C/C++ with
+[ps3recomp](https://github.com/sp00nznet/ps3recomp), built for the Switch with devkitPro/libnx, and the game is drawn
+by a Vulkan backend running on NVK (Mesa). RSX shaders are translated to SPIR-V on the console.
 
----
+> [!NOTE]
+> This repository contains **no game data and no code derived from the game**. You need your own copy of the PS3
+> disc and a decrypted `EBOOT.BIN`.
 
-## Progreso general: ~20 %
+## Status
 
+**Work in progress, not playable yet. Overall progress: ~20%.**
+
+```text
+Material & analysis      ██████████  100 %
+Boot (boot → menu)       ██████░░░░   60 %
+Graphics (RSX → Vulkan)  ███▌░░░░░░   35 %
+Switch layer (Horizon)   █████▌░░░░   55 %
+Performance (30 FPS)     ▌░░░░░░░░░    5 %
+Full game                ░░░░░░░░░░    0 %
+Full translation         ░░░░░░░░░░    0 %
 ```
-Material y análisis     ██████████  100 %
-Arranque (boot → menú)  ██████░░░░   60 %
-Gráficos (RSX → Vulkan) ███▌░░░░░░   35 %
-Capa Switch (Horizon)   █████▌░░░░   55 %
-Rendimiento (30 fps)    ▌░░░░░░░░░    5 %
-Juego completo          ░░░░░░░░░░    0 %
-Traducción completa     ░░░░░░░░░░    0 %
+
+On the console, at stock clocks with no overclock, it boots, reads the PSARCs, runs SPURS and the SPU jobs, shows the
+studio logos and credits (~45 FPS), plays the intro video and draws the **brightness calibration screen** with the
+game's own shaders (32 of 32 pipelines OK).
+
+**Where it is stuck:** from the video on, it drops to ~4 FPS and then nearly stalls. Some SPU jobs never run because
+thread creation runs out of memory (ENOMEM with 6 threads using 16 MB stacks). The pad does not get past the
+brightness screen yet.
+
+**Goals:**
+- **30 FPS without overclock.** This is the hardest one: the game leans heavily on all 6 SPUs, which run on 3 A57
+  cores on the Switch. The plan is to move MLAA from the SPUs to a shader AA pass, rewrite the hottest jobs with
+  NEON, add dynamic resolution and cut post effects (DoF, motion blur).
+- **Full Spanish translation.** The US disc only ships `ENGLISH.PSARC`. It needs the language PSARC from a European or
+  Latin American release (your own dump) or a text translation, plus fonts with á, ñ, ¿ and ¡.
+
+The detailed log is in [PORT_STATUS.md](PORT_STATUS.md) (newest first, in Spanish) and the phase plan is in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Installing on the Switch
+
+There is no playable release yet. The NRO and instructions will be published once it reaches the menu. Current test
+setup:
+
+```text
+/switch/gow3-nx/
+  gow3-nx.nro
+  PS3_GAME/PARAM.SFO
+  USRDIR/            (the PSARCs, CINEMATICS/ and SOUNDS/ from your disc)
 ```
 
-El porcentaje se calcula por fases y con peso: el rendimiento y el recorrido del juego entero son la mayor parte del trabajo que falta.
+Run it in full application mode (hold **R** while opening an installed game, or use a forwarder). Applet mode
+(Album) does not give it enough memory.
 
-## Lo que ya funciona (verificado en consola)
+## Layout
 
-| Área | Estado |
+| Path | What it is |
 |---|---|
-| Lift del PPU (todo el EBOOT) y de las SPU (8 ELF + PM de WWS + 19 jobs relocables) | ✅ |
-| HLE de LV2/PRX: hilos, lwmutex/lwcond, event queues, FS sobre `sdmc:` | ✅ |
-| Lectura de los PSARC, Edge zlib en SPU | ✅ |
-| SPURS: tasksets, jobs WWS, señales (MLAA cierra su pipeline por frame) | ✅ parcial |
-| RSX: FIFO real, semáforos, parking de command buffers de EDGE | ✅ |
-| Vulkan sobre **NVK** (mesa para Tegra X1): swapchain 1280×720 | ✅ |
-| Shaders del juego: RSX → HLSL → SPIR-V (glslang en consola), 32/32 pipelines OK | ✅ |
-| Video `cellVdec` (MPEG-2) sin FFmpeg: el stream termina y el juego sigue | ✅ (cuadros en negro) |
-| Logos y créditos del estudio en pantalla (~45 fps) | ✅ |
-| Pantalla de calibración de brillo bien dibujada | ✅ |
+| `port/` | The port's own code: `main.cpp` (boot and title environment), extra HLE (`lfqueue.cpp`, `stubs.cpp`) and the game's CMake |
+| `nx/` | Horizon layer: 4 GB guest memory, exception bridge, POSIX compat, glslang shims |
+| `patches/` | Switch changes on top of ps3recomp `de4f090` (Vulkan/NVK, cellVdec without FFmpeg, SPU job queue, FS) |
+| `tools/lift_reloc_jobmods.py` | Lifts the 19 relocatable WWS SPU jobs |
+| `docs/ROADMAP.md` | Phase plan (Spanish) |
 
-## Dónde está trabado ahora
+## Building (summary)
 
-1. **Hilos SPU asíncronos:** `pthread_create` da ENOMEM con 6 hilos vivos (stacks de 16 MB sacados del heap). Los jobs que quedan en la cola diferida no corren. El fix planeado es un pool fijo de workers y stacks más chicos.
-2. **Input:** el pad (A = CROSS) todavía no avanza la pantalla de brillo.
-3. **`cellSpursJoinTask2`** sin implementar.
+1. Install devkitPro (devkitA64 + libnx + switch-sdl2) and get the NVK SDK for Switch.
+2. Clone ps3recomp at `de4f090` and apply `patches/ps3recomp-switch.patch`.
+3. Decrypt your `EBOOT.BIN` (RPCS3: Utilities → Decrypt PS3 Binaries) and run the ps3recomp pipeline
+   (output goes to `port/ppu/` and `port/spu/`, which are never committed).
+4. Configure and build `port/` with the Switch toolchain.
 
-## Lo que falta
+## Credits
 
-### Para llegar a jugar
-- [ ] Pool de workers SPU y presupuesto de memoria (heap vs. VRAM vs. espacio guest de 4 GB)
-- [ ] Input por libnx/SDL hasta el menú principal
-- [ ] Estado gráfico que todavía no se respeta: blending, viewport/scissor, stencil, culling, samplers
-- [ ] Video real (FFmpeg estático de `switch-ffmpeg` o decodificador MPEG-2 propio) y audio (XVAG/ATRAC3)
-- [ ] Guardado (`cellSaveData`)
+- [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT): lifters, runtime and HLE.
+- [gow2-recomp](https://github.com/andrebrumdev/gow2-recomp) and [Ascension-R](https://github.com/rigaz29/Ascension-R),
+  references for the same Santa Monica Studio engine.
+- [RPCS3](https://github.com/RPCS3/rpcs3), devkitPro, libnx, glslang and Mesa/NVK.
 
-### Rendimiento (objetivo: 30 fps sin overclock)
-- [ ] Perfilar por subsistema: PPU, cada job SPU, walker del RSX, GPU
-- [ ] Sacar del intérprete los jobs WWS que todavía pasan por ahí (registrar las regiones y los 19 reloc)
-- [ ] MLAA por SPU → AA por shader en GPU (o apagarlo)
-- [ ] Jobs SPU calientes (skinning, culling, partículas) reescritos en C++ con NEON
-- [ ] Resolución dinámica (720p en dock, 540-600p en portátil), sombras, LOD y mips más bajos
-- [ ] Posibles parches de RPCS3 para BCUS-98111 1.00: MLAA, DoF, motion blur, bloom
+God of War is a property of Sony Interactive Entertainment. Non-commercial project.
 
-### Traducción
-- [ ] El disco US (BCUS-98111) trae **solo `ENGLISH.PSARC`**. Para tener textos y voces en español hace falta el `.PSARC` de idioma de una versión europea/latina (dump propio) o una traducción de los textos hecha desde cero.
-- [ ] Herramienta para extraer, editar y volver a empaquetar los textos (`LANGS_*.TXT` + PSARC)
-- [ ] Fuentes con caracteres en español (á é í ó ú ñ ¿ ¡)
+## Support
 
-## Mediciones
+If you like my work and want to support me:
 
-| Corrida | Qué pasó | fps |
-|---|---|---|
-| 10ª | RSX null, flips estables 9 min | ~4,4 |
-| 12ª | Vulkan/NVK + shaders, créditos en pantalla | ~8 |
-| 13ª | Logos / video de intro | ~45 / ~3,8 |
-| 16ª | El video termina, pantalla de brillo | 1 flip cada ~20 s (jobs SPU bloqueados) |
-
-## Cómo está armado
-
-- **Base:** [`sp00nznet/ps3recomp`](https://github.com/sp00nznet/ps3recomp) (MIT): lifters, runtime y HLE, con parches para Switch (`__SWITCH__`).
-- **Referencias:** `andrebrumdev/gow2-recomp` y `rigaz29/Ascension-R` (mismo engine de SMS), RPCS3.
-- **Gráficos:** backend Vulkan de ps3recomp sobre NVK estático (`libvulkan.a`) con `VK_NN_vi_surface`.
-- **Pruebas:** nxlink + sys-botbase (capturas y botones por red).
-
-## Compilar
-
-Hace falta devkitPro (devkitA64, libnx, switch-sdl2), el SDK de NVK para Switch y tu propio dump.
-
-| Carpeta | Qué hay |
-|---|---|
-| `port/` | `main.cpp` (arranque, entorno del título), HLE extra (`lfqueue.cpp`, `stubs.cpp`) y el CMake del juego |
-| `nx/` | Capa Switch: memoria guest de 4 GB, excepciones, compat POSIX, shims de glslang |
-| `patches/` | Parches a ps3recomp para Switch |
-| `tools/` | Lift de los jobs SPU relocables de WWS |
-| `docs/` | Roadmap por fases |
-
-Pasos: clonar ps3recomp en `de4f090` y aplicar el parche, correr el pipeline de ps3recomp sobre tu `EBOOT.ELF` desencriptado (salida en `port/ppu/` y `port/spu/`) y compilar `port/` con el toolchain de Switch. La guía detallada va a llegar cuando el port arranque hasta el menú.
-
-## Legal
-
-Proyecto de investigación sin fines de lucro. God of War es propiedad de Sony Interactive Entertainment. No se distribuyen assets, binarios del juego ni código generado a partir de ellos.
+<a href="https://tecito.app/tebit"><img src="https://img.shields.io/badge/Invitame_un-tecito-6d4aff?style=for-the-badge" alt="Invitame un tecito" height="32"></a>
