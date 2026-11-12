@@ -1,6 +1,6 @@
-# gow3-nx — God of War III (PS3) → Nintendo Switch
+<h1 align=center>God of War III — port para Nintendo Switch</h1>
 
-Port experimental por **recompilación estática**: el código PPU y SPU del `EBOOT.BIN` de PS3 se traduce por adelantado a C/C++, se compila con devkitA64/libnx y sale un `.nro` para homebrew. No es un emulador ni usa JIT.
+Port nativo **en desarrollo** de **God of War III** (PS3, 2010) para **Nintendo Switch** con homebrew (Atmosphère). Se hace por **recompilación estática**: el código PPU y SPU del `EBOOT.BIN` de PS3 se traduce por adelantado a C/C++, se compila con devkitA64/libnx y sale un `.nro` para homebrew. No es un emulador ni usa JIT.
 
 > **Este repositorio no contiene el juego ni código derivado de él.** No hay EBOOT, PSARC, videos, audio, ni el código PPU/SPU generado por el lifter. Para usarlo hay que tener un dump propio del disco (BCUS-98111 v1.00).
 
