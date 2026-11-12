@@ -1,0 +1,20 @@
+# Nunca subir material del juego ni código derivado de él
+game/
+romfs/
+sd/
+analysis/
+port/ppu/
+port/ppu_old_nohle/
+port/spu/
+port/out/
+*.BIN
+*.ELF
+*.elf
+*.PSARC
+*.M2V
+*.XVAG
+*.SFO
+*.nro
+*.iso
+_logs/
+*.log

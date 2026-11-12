@@ -1,0 +1,1 @@
+Base: `sp00nznet/ps3recomp` @ `de4f090` (MIT). Parches `__SWITCH__` (Vulkan/NVK, cellVdec sin FFmpeg, cola diferida de SPU, FS). Aplicar en el clon: `git apply --ignore-whitespace ps3recomp-switch.patch`

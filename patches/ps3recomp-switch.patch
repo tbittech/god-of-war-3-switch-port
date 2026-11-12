@@ -1,0 +1,482 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a39405d..ce711af 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -187,7 +187,9 @@ if(PS3RECOMP_RSX_VULKAN)
+     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+     # PUBLIC: ps3recomp_host selects its backend on this definition.
+     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
+-    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
++    if(NOT NINTENDO_SWITCH)   # Switch: dlopen va stubeado en nx_compat, no hay libdl
++        target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
++    endif()
+     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+ endif()
+ 
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index 7e222c9..397ab9f 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -69,6 +69,7 @@ typedef struct {
+     u32 auCount;        /* total AUs decoded */
+     u16 width;          /* configured resolution (0 = use default) */
+     u16 height;
++    u32 noffTicks;      /* no-FFmpeg path: frame period from the MPEG-2 sequence header (90 kHz) */
+     /* Decoder path: NULL when there is no libavcodec, and then nothing
+      * below is used. */
+     VdecFf* ff;
+@@ -350,6 +351,11 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
+ 
+     VDEC_LOCK();
+     s_vdec[handle].seqStarted = 1;
++    s_vdec[handle].nextPts = 0;   /* no-FFmpeg MPEG-2 path synthesizes PTS too */
++    if (!s_vdec[handle].ff) {
++        vdec_queue_clear(&s_vdec[handle]);   /* no-FFmpeg placeholder items */
++        s_vdec[handle].hasPic = 0;
++    }
+     if (s_vdec[handle].ff) {
+         /* A new sequence: nothing from the last one is shown. */
+         vdec_ff_reset(s_vdec[handle].ff);
+@@ -451,19 +457,63 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+      * picture. Games that only check for completion (not pixel data) will
+      * proceed correctly. */
+     v->auCount++;
++    /* MPEG-2 without FFmpeg: take the frame rate (and size) from a sequence
++     * header in the AU, and give a time stamp to AUs that carry none, as the
++     * decoder path does. A player that paces by frame_rate_code/PTS (GoW:A,
++     * GoW3) otherwise never reaches the last picture and never ends. */
++    u64 npts = au.pts, ndts = au.dts;
++    if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
++        static const u32 rate_ticks[9] = { 0, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500 };
++        const u8* b = au.size ? vm_ptr8(au.startAddr) : NULL;
++        const u32 lim = au.size > 512u ? 512u : au.size;
++        for (u32 i = 0; b && i + 8 <= lim; i++) {
++            if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 && b[i + 3] == 0xB3) {
++                const u8 code = b[i + 7] & 0x0Fu;
++                if (code >= 1 && code <= 8) v->noffTicks = rate_ticks[code];
++                if (!v->width) {
++                    v->width  = (u16)((b[i + 4] << 4) | (b[i + 5] >> 4));
++                    v->height = (u16)(((b[i + 5] & 0x0Fu) << 8) | b[i + 6]);
++                }
++                break;
++            }
++        }
++        const u32 ticks = v->noffTicks ? v->noffTicks : 3003u;
++        if (npts == ~0ull) npts = v->nextPts;
++        v->nextPts = npts + ticks;
++        if (ndts == ~0ull) ndts = npts;
++    }
+     memset(&v->lastPic, 0, sizeof(v->lastPic));
+     v->lastPic.codecType = v->codecType;
+     v->lastPic.startAddr = au.startAddr;
+     v->lastPic.size      = au.size;
+     v->lastPic.auNum     = v->auCount;
+-    v->lastPic.pts       = au.pts;
+-    v->lastPic.dts       = au.dts;
++    v->lastPic.pts       = npts;
++    v->lastPic.dts       = ndts;
+     v->lastPic.userData  = au.userData;
+     v->lastPic.status    = 0; /* OK */
+     v->lastPic.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
+     v->lastPic.width     = v->width ? v->width : 1280;
+     v->lastPic.height    = v->height ? v->height : 720;
++    /* One placeholder per AU, queued: a player that counts AUs sent against
++     * pictures taken (GoW3's spins on GetPicItem while taken < sent) must get
++     * one picture per AU even when it sends several before taking any. A
++     * single slot lost them and the player waited forever. */
++    VDEC_LOCK();
++    if (v->qCount == VDEC_QUEUE) {                     /* full: drop the oldest */
++        v->qHead = (v->qHead + 1) % VDEC_QUEUE;
++        v->qCount--;
++    }
++    {
++        VdecPic* q = &v->queue[(v->qHead + v->qCount) % VDEC_QUEUE];
++        memset(q, 0, sizeof *q);
++        q->item = v->lastPic;
++        q->pictType = 1;                               /* I */
++        q->key = 1;
++        q->frameTicks = v->noffTicks ? v->noffTicks : 3003u;
++        v->qCount++;
++    }
+     v->hasPic = 1;
++    VDEC_UNLOCK();
+ 
+     vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+ 
+@@ -569,10 +619,20 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+         VDEC_UNLOCK();
+         return CELL_OK;
+     }
+-    if (!s_vdec[handle].hasPic)
++    /* No FFmpeg: the queued placeholder items (frame_rate_code etc. too:
++     * left 0 the player's rate is 0). */
++    VDEC_LOCK();
++    if (!v->qCount) {
++        VDEC_UNLOCK();
+         return (s32)CELL_VDEC_ERROR_EMPTY;
+-    vdec_write_item(handle, &v->lastPic);
++    }
++    {
++        const VdecPic* q = &v->queue[v->qHead];
++        vdec_write_item(handle, &q->item);
++        vdec_write_pic_type(handle, q);
++    }
+     vm_write32(out, VDEC_ITEM_EA(handle));
++    VDEC_UNLOCK();
+     return CELL_OK;
+ }
+ 
+@@ -620,15 +680,21 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
+         VDEC_UNLOCK();
+         return rc;
+     }
+-    if (!v->hasPic)
++    VDEC_LOCK();
++    if (!v->qCount) {
++        VDEC_UNLOCK();
+         return (s32)CELL_VDEC_ERROR_EMPTY;
+-    v->hasPic = 0;
++    }
++    u32 w = v->queue[v->qHead].item.width, h = v->queue[v->qHead].item.height;
++    v->qHead = (v->qHead + 1) % VDEC_QUEUE;
++    v->qCount--;
++    v->hasPic = v->qCount != 0;
++    VDEC_UNLOCK();
+     if (!dst)
+         return CELL_OK;                                /* a skip: consume only */
+ 
+     u32 type  = vm_read32(fmt_ea + 0);
+     u8  alpha = vm_read8(fmt_ea + 8);
+-    u32 w = v->lastPic.width, h = v->lastPic.height;
+     u8 row[4096 * 4];
+     u32 rowlen;
+     switch (type) {
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index f78c66f..5b9f5f9 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -58,6 +58,21 @@
+ #include <SDL2/SDL.h>
+ #include <SDL2/SDL_vulkan.h>
+ 
++#ifdef __SWITCH__
++/* GoW3-nx: NVK enlazado estatico (sin dlopen) y la ventana es el NWindow por
++ * defecto de libnx con VK_NN_vi_surface, no una ventana de SDL (el SDL2 de
++ * devkitPro no trae Vulkan). Los pocos usos de SDL de ventana se desvian aca. */
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);
++extern void* nwindowGetDefault(void);
++static int nx_vk_create_surface(VkInstance inst, VkSurfaceKHR* out);
++#define SDL_Vulkan_GetDrawableSize(w_, pw, ph) ((void)(w_), *(pw) = 1280, *(ph) = 720)
++#define SDL_GetWindowFlags(w_)                 ((void)(w_), 0u)
++#define SDL_DestroyWindow(w_)                  ((void)(w_))
++#define SDL_QuitSubSystem(f_)                  ((void)0)
++#define SDL_Vulkan_CreateSurface(w_, inst, ps) nx_vk_create_surface((inst), (ps))
++#define SDL_PollEvent(e_)                      ((void)(e_), 0)
++#endif
++
+ #include <dlfcn.h>
+ #include <pthread.h>
+ #include <stddef.h>
+@@ -252,6 +267,9 @@ static vk_state s_vk;
+  * -------------------------------------------------------------------------*/
+ static int vk_load_library(void)
+ {
++#ifdef __SWITCH__
++    pvkGetInstanceProcAddr = vkGetInstanceProcAddr;
++#else
+     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
+     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
+         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+@@ -262,6 +280,7 @@ static int vk_load_library(void)
+     pvkGetInstanceProcAddr =
+         (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
+     if (!pvkGetInstanceProcAddr) { VK_LOG("libvulkan has no vkGetInstanceProcAddr\n"); return -1; }
++#endif
+ #define LOAD_G(name) \
+     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
+         { VK_LOG("missing global function " #name "\n"); return -1; }
+@@ -1745,6 +1764,18 @@ static void vk_window_drop(const char* why)
+ 
+ static void vk_window_open(const char* title)
+ {
++#ifdef __SWITCH__
++    (void)title;
++    if (getenv("PS3RECOMP_VK_WINDOW") && !vk_env_on("PS3RECOMP_VK_WINDOW")) return;   /* =0: headless */
++    s_vk.window = (SDL_Window*)nwindowGetDefault();
++    if (!s_vk.window) { VK_LOG("window disabled: nwindowGetDefault() == NULL\n"); return; }
++    s_vk.windowed = 1;
++    s_vk.inst_exts[0] = "VK_KHR_surface";
++    s_vk.inst_exts[1] = "VK_NN_vi_surface";
++    s_vk.inst_ext_count = 2;
++    VK_LOG("window: libnx default NWindow %p, VK_NN_vi_surface\n", (void*)s_vk.window);
++    return;
++#endif
+     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
+@@ -4225,4 +4256,19 @@ int rsx_vulkan_backend_depth_bounds(void)
+     return s_vk.eng_active && s_vk.depth_bounds_ok;
+ }
+ 
++#ifdef __SWITCH__
++/* VkViSurfaceCreateInfoNN (vulkan_vi.h), declarado aca para no depender de VK_USE_PLATFORM_VI_NN. */
++static int nx_vk_create_surface(VkInstance inst, VkSurfaceKHR* out)
++{
++    typedef struct { VkStructureType sType; const void* pNext; VkFlags flags; void* window; } nx_vi_ci;
++    typedef VkResult (VKAPI_PTR *nx_pfn)(VkInstance, const nx_vi_ci*, const VkAllocationCallbacks*, VkSurfaceKHR*);
++    nx_pfn fn = (nx_pfn)pvkGetInstanceProcAddr(inst, "vkCreateViSurfaceNN");
++    if (!fn) { VK_LOG("the driver has no vkCreateViSurfaceNN\n"); return 0; }
++    nx_vi_ci ci = { (VkStructureType)1000062000 /* VI_SURFACE_CREATE_INFO_NN */, NULL, 0, (void*)s_vk.window };
++    VkResult r = fn(inst, &ci, NULL, out);
++    if (r != VK_SUCCESS) { VK_LOG("vkCreateViSurfaceNN failed (VkResult %d)\n", (int)r); return 0; }
++    return 1;
++}
++#endif
++
+ #endif /* !_WIN32 */
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 37e3745..f1654f2 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -341,7 +341,9 @@ static void cellFsOpen(ppu_context* ctx)
+           { const char* want = ps3_env_once("FS_STACK");
+             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
+           } }
+-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
++      else { static int _no = 0;
++          if (PS3_LOG_FIRST(_no, 200))
++              fprintf(stderr, "[fs] open '%s' flags=0x%X -> fd %d\n", gpath, flags, fd); } }
+     if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+          * which criMv/criFs function opened the movie, so the reader-attach path
+@@ -890,8 +892,28 @@ static void cellFsMkdir(ppu_context* ctx)
+     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* Real removal: a stubbed CELL_OK left the file in place, and a cache layer
++ * (GoW3's fios) that deletes an invalid cache and recreates it reopened the same
++ * stale file forever. */
++static int fs_remove_path(ppu_context* ctx, int dir)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    host_path(hpath, sizeof hpath, gpath);
++    int rc = dir ? rmdir(hpath) : remove(hpath);
++    static int _n = 0;
++    if (PS3_LOG_FIRST(_n, 40))
++        fprintf(stderr, "[fs] %s '%s' -> %d\n", dir ? "rmdir" : "unlink", gpath, rc);
++    return rc;
++}
++static void cellFsRmdir(ppu_context* ctx)
++{
++    ctx->gpr[3] = fs_remove_path(ctx, 1) == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_ENOENT;
++}
++static void cellFsUnlink(ppu_context* ctx)
++{
++    ctx->gpr[3] = fs_remove_path(ctx, 0) == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_ENOENT;
++}
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index f922b74..1190bd4 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1021,7 +1021,48 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
+     return 0;
+ }
+ #else
+-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
++/* Jobs whose thread could not be created (Horizon caps a process's threads and
++ * commits each pthread stack from the heap). They used to be freed with the
++ * task already marked running, so its id never came back: God of War III's
++ * particle taskset ran out of all 128 ids after ~170 dispatches and the game
++ * crawled at one frame per 20 s. Now they wait here and the next async thread
++ * that finishes its own job runs them. */
++static pthread_mutex_t s_async_defer_lock = PTHREAD_MUTEX_INITIALIZER;
++static spu_async_job* s_async_defer[256];
++static unsigned s_async_defer_head, s_async_defer_count;
++static volatile int s_async_live;
++static int spu_async_defer_push(spu_async_job* j)
++{
++    int ok = 0;
++    pthread_mutex_lock(&s_async_defer_lock);
++    if (s_async_defer_count < 256) {
++        s_async_defer[(s_async_defer_head + s_async_defer_count) % 256] = j;
++        s_async_defer_count++;
++        ok = 1;
++    }
++    pthread_mutex_unlock(&s_async_defer_lock);
++    return ok;
++}
++static spu_async_job* spu_async_defer_pop(void)
++{
++    spu_async_job* j = NULL;
++    pthread_mutex_lock(&s_async_defer_lock);
++    if (s_async_defer_count) {
++        j = s_async_defer[s_async_defer_head];
++        s_async_defer_head = (s_async_defer_head + 1) % 256;
++        s_async_defer_count--;
++    }
++    pthread_mutex_unlock(&s_async_defer_lock);
++    return j;
++}
++static void* spu_async_thread(void* p)
++{
++    __atomic_add_fetch(&s_async_live, 1, __ATOMIC_RELAXED);
++    for (spu_async_job* j = (spu_async_job*)p; j; j = spu_async_defer_pop())
++        spu_async_run(j);
++    __atomic_sub_fetch(&s_async_live, 1, __ATOMIC_RELAXED);
++    return NULL;
++}
+ #endif
+ 
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+@@ -1351,6 +1392,33 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
+     spu_lockline_unlock();
+ }
+ 
++/* Atomic test-and-clear of a task's signalled bit (under lock-line, so a
++ * spu_signalled_update(set=1) is either before it -- consumed -- or after it
++ * -- left pending for the next WAIT_SIGNAL). Testing and clearing in two steps
++ * dropped a signal that landed in between (GoW3: Edge zlib's task parked for
++ * good while FIOS waited on its event flag). Must NOT be called with
++ * s_sig_lock held. Returns 1 if the bit was set. */
++static int spu_signalled_take(uint32_t taskset_ea, uint32_t taskId)
++{
++    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
++    extern void spu_coh_notify_write(uint32_t);
++    extern uint8_t* vm_base;
++    const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
++    const uint32_t mask = (1u << 31) >> (taskId % 32u);
++    uint8_t* p = vm_base + word;
++    int had;
++    spu_lockline_lock();
++    uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++    had = (v & mask) != 0;
++    if (had) {
++        v &= ~mask;
++        p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++        spu_coh_notify_write(word);
++    }
++    spu_lockline_unlock();
++    return had;
++}
++
+ /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by
+  * guest SPU/PPU atomics that bypass spu_taskset_signal_task. Coherence calls
+  * this with lock-line held; the guest bit remains the only predicate. */
+@@ -1530,23 +1598,26 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     spu_lockline_lock();
+     spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
+     spu_lockline_unlock();
++    /* Consume with an atomic test-and-clear (spu_signalled_take, outside
++     * s_sig_lock: lock-line must not nest in it). Sleep only after re-testing
++     * the bit under s_sig_lock: the signaller sets the bit first and then
++     * broadcasts under s_sig_lock, so no wake is lost between the two. */
++    while (!spu_signalled_take(taskset_ea, taskId)) {
++        int timed_out = 0;
+ #ifdef _WIN32
+-    AcquireSRWLockExclusive(&s_sig_lock);
+-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+-            static int _n = 0;
+-            if (++secs && _n < 16) { _n++;
+-                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+-                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+-            if (drain && secs >= drain) { drained = 1; break; }
+-        }
+-    }
+-    ReleaseSRWLockExclusive(&s_sig_lock);
++        AcquireSRWLockExclusive(&s_sig_lock);
++        if (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId))
++            timed_out = !SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0);
++        ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+-    pthread_mutex_lock(&s_sig_lock);
+-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+-        if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
++        pthread_mutex_lock(&s_sig_lock);
++        if (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
++            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
++            timed_out = pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0;
++        }
++        pthread_mutex_unlock(&s_sig_lock);
++#endif
++        if (timed_out) {
+             static int _n = 0;
+             if (++secs && _n < 16) { _n++;
+                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+@@ -1554,13 +1625,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+             if (drain && secs >= drain) { drained = 1; break; }
+         }
+     }
+-    pthread_mutex_unlock(&s_sig_lock);
+-#endif
+     spu_lockline_lock();
+     spu_coh_watch_remove(&watch);
+     spu_lockline_unlock();
+-    /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
++    /* The signal was consumed by spu_signalled_take above. */
+     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
+         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+@@ -1679,11 +1747,16 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * mmap'd and committed on touch, so this reserves address space rather
+      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
+      * the guard page above. */
++#ifdef __SWITCH__
++#define SPU_ASYNC_STACK_BYTES (16u << 20)   /* libnx commits pthread stacks from the heap */
++#else
++#define SPU_ASYNC_STACK_BYTES (256u << 20)
++#endif
+     pthread_t th;
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+     int prc = EINVAL;
+-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
++    if (pthread_attr_setstacksize(&attr, SPU_ASYNC_STACK_BYTES) == 0)
+         prc = pthread_create(&th, &attr, spu_async_thread, j);
+     pthread_attr_destroy(&attr);
+     /* A host that will not reserve that much still gets the thread, on the
+@@ -1691,7 +1764,17 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * beats never dispatching at all. */
+     if (prc != 0)
+         prc = pthread_create(&th, NULL, spu_async_thread, j);
+-    if (prc != 0) { free(j); return 0; }
++    if (prc != 0) {
++        static int s_fail_log = 0;
++        const int queued = spu_async_defer_push(j);
++        if (s_fail_log < 20 || (s_fail_log % 100) == 0)
++            fprintf(stderr, "[spu_workload] async thread create FAILED rc=%d (live=%d) image=%d "
++                            "task=%u -> %s\n", prc, s_async_live, j->image_id, j->taskid,
++                    queued ? "deferred to the next finishing thread" : "DROPPED (defer queue full)");
++        s_fail_log++;
++        if (!queued) { free(j); return 0; }
++        return 1;
++    }
+     pthread_detach(th);
+ #endif
+     return 1;
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index b997931..ef9fe33 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -36,7 +36,13 @@ static PPU_TLS int     s_exit_armed = 0;
+ /* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
+  * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
+  * down; keep the two in step so a stack-depth bug reproduces on both. */
++#ifdef __SWITCH__
++/* libnx carves pthread stacks out of the heap and commits them whole: 256 MB
++ * per thread ran out of memory by the third guest thread (ENOMEM). */
++#define PPU_HOST_STACK_BYTES  (8u * 1024u * 1024u)
++#else
+ #define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
++#endif
+ 
+ #ifdef _WIN32
+ #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
