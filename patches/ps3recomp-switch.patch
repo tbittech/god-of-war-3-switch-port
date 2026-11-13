@@ -1,5 +1,5 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
-index a39405d..ce711af 100644
+﻿diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a39405d6..ce711af1 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -187,7 +187,9 @@ if(PS3RECOMP_RSX_VULKAN)
@@ -13,11 +13,53 @@ index a39405d..ce711af 100644
      message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
  endif()
  
+diff --git a/include/ps3emu/ps3_ftrace.h b/include/ps3emu/ps3_ftrace.h
+index b975293d..52559e63 100644
+--- a/include/ps3emu/ps3_ftrace.h
++++ b/include/ps3emu/ps3_ftrace.h
+@@ -116,19 +116,22 @@ static inline void ps3_ft_dump(void)
+     }
+     uint32_t n = __atomic_load_n(&s->n, __ATOMIC_ACQUIRE);
+     if (n > s->cap) n = s->cap;
+-    FILE* f = fopen(s->path, "w");
++    /* 56a: path "-" = stderr (nxlink), each line prefixed "@ft " for grep. */
++    const int to_err = s->path[0] == '-' && !s->path[1];
++    const char* pf = to_err ? "@ft " : "";
++    FILE* f = to_err ? stderr : fopen(s->path, "w");
+     if (!f) { fprintf(stderr, "[ftrace] cannot write %s\n", s->path); return; }
+-    fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u\n",
++    fprintf(f, "%s# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u\n", pf,
+             (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped);
+     for (uint32_t t = 0; t < PS3_FT_TIDS; t++)
+-        if (s->names[t][0]) fprintf(f, "T %u %s\n", t, s->names[t]);
++        if (s->names[t][0]) fprintf(f, "%sT %u %s\n", pf, t, s->names[t]);
+     for (uint32_t i = 0; i < n; i++) {
+         const ps3_ft_rec* r = &s->buf[i];
+         if (!r->kind) continue;   /* claimed but never filled: a writer raced the dump */
+-        fprintf(f, "%u %u %x %x %.3f %.3f\n", r->kind, r->who, r->a, r->b,
++        fprintf(f, "%s%u %u %x %x %.3f %.3f\n", pf, r->kind, r->who, r->a, r->b,
+                 (double)(r->t0 - s->base) / 1e3, (double)(r->t1 - s->base) / 1e3);
+     }
+-    fclose(f);
++    if (to_err) fflush(f); else fclose(f);
+     fprintf(stderr, "[ftrace] wrote %u spans (%u dropped) to %s\n", n, s->dropped, s->path);
+ }
+ 
 diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
-index 7e222c9..397ab9f 100644
+index 7e222c92..8fca86c8 100644
 --- a/libs/codec/cellVdec.c
 +++ b/libs/codec/cellVdec.c
-@@ -69,6 +69,7 @@ typedef struct {
+@@ -45,7 +45,8 @@ static u64 vdec_now_ms(void)
+  * Internal state
+  * -----------------------------------------------------------------------*/
+ #define MAX_VDEC 4
+-#define VDEC_QUEUE   32   /* decoded pictures waiting for GetPicture */
++#define VDEC_QUEUE   512  /* pictures waiting for GetPicture (placeholders: ~100 B each) */
++#define VDEC_FF_QUEUE 32  /* decoded frames carry YUV: keep that bound low */
+ #define VDEC_BUSY_AT 16   /* refuse new AUs past this many (EndSeq can add more) */
+ #define VDEC_AU_RING 64   /* AUs remembered for pictures that come out late */
+ 
+@@ -69,6 +70,7 @@ typedef struct {
      u32 auCount;        /* total AUs decoded */
      u16 width;          /* configured resolution (0 = use default) */
      u16 height;
@@ -25,7 +67,16 @@ index 7e222c9..397ab9f 100644
      /* Decoder path: NULL when there is no libavcodec, and then nothing
       * below is used. */
      VdecFf* ff;
-@@ -350,6 +351,11 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
+@@ -125,7 +127,7 @@ static void vdec_queue_clear(VdecSlot* v)
+ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+ {
+     VdecSlot* v = (VdecSlot*)ctx;
+-    if (v->qCount == VDEC_QUEUE) {
++    if (v->qCount == VDEC_FF_QUEUE) {
+         printf("[cellVdec] picture queue full; dropping the oldest\n");
+         free(v->queue[v->qHead].yuv);
+         v->qHead = (v->qHead + 1) % VDEC_QUEUE;
+@@ -350,6 +352,11 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
  
      VDEC_LOCK();
      s_vdec[handle].seqStarted = 1;
@@ -37,7 +88,7 @@ index 7e222c9..397ab9f 100644
      if (s_vdec[handle].ff) {
          /* A new sequence: nothing from the last one is shown. */
          vdec_ff_reset(s_vdec[handle].ff);
-@@ -451,19 +457,63 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+@@ -451,19 +458,65 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
       * picture. Games that only check for completion (not pixel data) will
       * proceed correctly. */
      v->auCount++;
@@ -86,6 +137,8 @@ index 7e222c9..397ab9f 100644
 +     * single slot lost them and the player waited forever. */
 +    VDEC_LOCK();
 +    if (v->qCount == VDEC_QUEUE) {                     /* full: drop the oldest */
++        printf("[cellVdec] placeholder queue full (%u): dropped one at AU %u\n",
++               (unsigned)VDEC_QUEUE, v->auCount);
 +        v->qHead = (v->qHead + 1) % VDEC_QUEUE;
 +        v->qCount--;
 +    }
@@ -103,7 +156,7 @@ index 7e222c9..397ab9f 100644
  
      vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
  
-@@ -569,10 +619,20 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+@@ -569,10 +622,20 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
          VDEC_UNLOCK();
          return CELL_OK;
      }
@@ -126,7 +179,7 @@ index 7e222c9..397ab9f 100644
      return CELL_OK;
  }
  
-@@ -620,15 +680,21 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
+@@ -620,15 +683,21 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
          VDEC_UNLOCK();
          return rc;
      }
@@ -151,8 +204,288 @@ index 7e222c9..397ab9f 100644
      u8 row[4096 * 4];
      u32 rowlen;
      switch (type) {
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index b09220e2..d39b5ce5 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <stdint.h>
+ #include "ps3emu/log_first.h"
++#include "ps3emu/spu_prof.h"
+ 
+ /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
+  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
+@@ -466,6 +467,7 @@ struct SpursPmSlot {
+     const uint8_t* pm;
+     u64 data;
+     HANDLE thread;
++    u64 t_busy_us;   /* SPU_PROF: when the kernel marked this slot busy */
+ };
+ static struct SpursInst {
+     u32 ea, nspus;
+@@ -1491,10 +1493,18 @@ s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
+         context_ea    = (u32)vm_read64((u32)attr_ea + TASK2ATTR_EA_CTX);
+         ls_pattern_ea = (u32)attr_ea + TASK2ATTR_LS_PAT;
+     }
++    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+     s32 rc = cellSpursCreateTask(taskset, (CellSpursTaskId*)(uintptr_t)(u32)id_ea,
+                                  (void*)(uintptr_t)(u32)elf_ea,
+                                  (void*)(uintptr_t)context_ea, size_context,
+                                  ls_pattern_ea, (u32)argument_ea);
++    clock_gettime(CLOCK_MONOTONIC, &t1);
++    {   /* SPU_TIMING diagnostic: GoW3's main thread was caught inside here. */
++        static int s_n = 0;
++        const long long us = (t1.tv_sec - t0.tv_sec) * 1000000LL + (t1.tv_nsec - t0.tv_nsec) / 1000;
++        if (us > 5000 && s_n < 60) { s_n++;
++            fprintf(stderr, "[spu-time] CreateTask2 took %lld us (rc=0x%08X)\n", us, (u32)rc); }
++    }
+     return rc;
+ }
+ 
+@@ -1992,17 +2002,24 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+ #endif
+     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
++    sprof_thread('W', (uint32_t)slot->spu_num);
+     AcquireSRWLockExclusive(&si->lock);
+     for (;;) {
++        sprof_set(SPROF_IDLE, 0);
+         while (!slot->busy && !si->stopping)
+             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+         if (si->stopping && !slot->busy) break;
+         ReleaseSRWLockExclusive(&si->lock);
++        const uint64_t sp_t1 = sprof_now_us();
++        sprof_set(SPROF_RUN, (uint32_t)slot->image_id);
+         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+                               slot->data, slot->wid, slot->ea, slot->spu_num);
+         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+         unsigned polls = g_spurs_pm_polls;
++        if (sp_t1) sprof_pm_run(slot->wid, sp_t1 - slot->t_busy_us, sprof_now_us() - sp_t1, polls);
++        sprof_set(SPROF_LOCK, 0x5C0Cu);   /* place 0x5C0C = si->lock after a run */
+         AcquireSRWLockExclusive(&si->lock);
++        sprof_set(SPROF_DISPATCH, 0);
+         u32 wid = slot->wid;
+         if (si->active[wid]) si->active[wid]--;
+         spu_lockline_lock();
+@@ -2014,6 +2031,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+         WakeAllConditionVariable(&si->wake);
+     }
+     ReleaseSRWLockExclusive(&si->lock);
++    sprof_thread_exit();
+     ps3_tprof_thread_exit();
+     return 0;
+ }
+@@ -2024,6 +2042,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     ps3_thread_name("spurs kernel");
+     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
+     unsigned kick_run = 0;
++    sprof_thread('K', 0);
+     AcquireSRWLockExclusive(&si->lock);
+     while (!si->stopping) {
+         /* A request line committed during the last pass: look again now. Such a
+@@ -2036,6 +2055,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
+             kick_pass = ++kick_run < 16;
+         } else {
++            sprof_set(SPROF_KSLEEP, 0);
+             SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+             /* This full pass reads the line after any commit that woke it. */
+             (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
+@@ -2043,6 +2063,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         if (!kick_pass) kick_run = 0;
+         if (si->stopping) break;
+         if (disabled) continue;
++        sprof_set(SPROF_KSCAN, 0);
++        sprof_kernel_pass(kick_pass);
+         u32 ea = si->ea;
+         AcquireSRWLockExclusive(&s_workload_registry_lock);
+         if (!kick_pass) si->pass_no++;
+@@ -2092,6 +2114,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 spu_lockline_lock();
+                 wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
+                 ef_line_end(ea);
++                slot->t_busy_us = sprof_now_us();
++                sprof_kernel_dispatch(kicked);
+                 slot->busy = 1;
+                 WakeAllConditionVariable(&si->wake);
+                 break;
+@@ -2100,6 +2124,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         ReleaseSRWLockExclusive(&s_workload_registry_lock);
+     }
+     ReleaseSRWLockExclusive(&si->lock);
++    sprof_thread_exit();
+     return 0;
+ }
+ 
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index f073f327..1d7837e2 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2166,6 +2166,145 @@ static void wprof_note_walker(void)
+     }
+     pthread_detach(t);
+ }
++#elif defined(__SWITCH__)
++/* 57a: Switch version of the walker profiler. RSX_WALKER_PROF="<start_s>:<seconds>"
++ * (e.g. "160:12"). The first thread to drain the FIFO is the one sampled:
++ * starting <start_s> seconds after it arms, a sampler thread pauses it every
++ * millisecond (svcSetThreadActivity), reads its registers (svcGetThreadContext3)
++ * and its frame-pointer chain, and resumes it. Samples are aggregated into two
++ * static tables keyed by offset from __start__ (the NRO image base):
++ * exclusive (pc) and inclusive (pc, lr and every return address, once per
++ * sample). At the end of the window the top entries go to stderr as [wprof]
++ * lines. libnx declared by hand (its u8..u64 clash with the runtime's), as in
++ * spu_prof_impl.inc. Diagnostic only, off unless RSX_WALKER_PROF is set. */
++#include <pthread.h>
++#include <time.h>
++/* 57a: mirror of libnx ThreadContext (switch/arm/thread_context.h). */
++typedef struct {
++    uint64_t cpu_gprs[29];
++    uint64_t fp;
++    uint64_t lr;
++    uint64_t sp;
++    uint64_t pc;                         /* CpuRegister pc (.x) */
++    uint32_t psr;
++    __attribute__((aligned(16))) unsigned char fpu_gprs[32][16];
++    uint32_t fpcr;
++    uint32_t fpsr;
++    uint64_t tpidr;
++} wprof_nx_ctx;
++_Static_assert(sizeof(wprof_nx_ctx) == 0x320, "57a: ThreadContext layout");
++extern uint32_t threadGetCurHandle(void);
++extern uint32_t svcSetThreadActivity(uint32_t handle, uint32_t activity); /* ThreadActivity */
++extern uint32_t svcGetThreadContext3(wprof_nx_ctx* ctx, uint32_t handle);
++extern char __start__[];
++enum { WPROF_RUNNABLE = 0, WPROF_PAUSED = 1 };  /* ThreadActivity_Runnable / _Paused */
++enum { WPROF_HSIZE = 8192, WPROF_CHAIN = 8, WPROF_TOP_X = 60, WPROF_TOP_I = 120 };
++static atomic_int s_wprof_state;     /* 0 unset, 1 armed, 2 done */
++static uint32_t s_wprof_handle;
++static int s_wprof_start_s, s_wprof_secs;
++static u64 s_wprof_armed_ns;
++/* 57a: open-addressed tables, reserved statically (no malloc while sampling). */
++static uintptr_t s_wprof_xkey[WPROF_HSIZE], s_wprof_ikey[WPROF_HSIZE];
++static uint32_t  s_wprof_xcnt[WPROF_HSIZE], s_wprof_icnt[WPROF_HSIZE];
++static unsigned char s_wprof_taken[WPROF_HSIZE];
++static void wprof_hadd(uintptr_t* key, uint32_t* cnt, uintptr_t off)
++{
++    uint32_t h = (uint32_t)(((uint64_t)(off >> 2) * 0x9E3779B97F4A7C15ull) >> 51) & (WPROF_HSIZE - 1);
++    for (unsigned p = 0; p < WPROF_HSIZE; p++, h = (h + 1) & (WPROF_HSIZE - 1)) {
++        if (cnt[h] == 0) { key[h] = off; cnt[h] = 1; return; }
++        if (key[h] == off) { cnt[h]++; return; }
++    }
++    /* full: dropped */
++}
++static void wprof_dump_top(const char* tag, const uintptr_t* key, const uint32_t* cnt, int top)
++{
++    memset(s_wprof_taken, 0, sizeof s_wprof_taken);
++    for (int k = 0; k < top; k++) {
++        int best = -1;
++        for (int i = 0; i < WPROF_HSIZE; i++)
++            if (cnt[i] && !s_wprof_taken[i] && (best < 0 || cnt[i] > cnt[best])) best = i;
++        if (best < 0) break;
++        s_wprof_taken[best] = 1;
++        fprintf(stderr, "[wprof] %s %llx %u\n", tag, (unsigned long long)key[best], cnt[best]);
++    }
++}
++static void* wprof_thread(void* arg)
++{
++    (void)arg;
++    const struct timespec poll = {0, 100000000}, tick = {0, 1000000};
++    const u64 start_ns = s_wprof_armed_ns + (u64)s_wprof_start_s * 1000000000ULL;
++    while (get_timestamp_ns() < start_ns) nanosleep(&poll, NULL);
++    const uintptr_t base = (uintptr_t)__start__;
++    const uint32_t h = s_wprof_handle;
++    const u64 deadline = get_timestamp_ns() + (u64)s_wprof_secs * 1000000000ULL;
++    unsigned long long samples = 0, fails = 0;
++    static wprof_nx_ctx ctx;
++    do {
++        uintptr_t addr[2 + WPROF_CHAIN];
++        unsigned na = 0;
++        /* 57a: while the walker is paused: no malloc, no printf, no locks. */
++        if (svcSetThreadActivity(h, WPROF_PAUSED) != 0) { fails++; nanosleep(&tick, NULL); continue; }
++        if (svcGetThreadContext3(&ctx, h) == 0) {
++            const uintptr_t sp = (uintptr_t)ctx.sp;
++            uintptr_t fp = (uintptr_t)ctx.fp;
++            addr[na++] = (uintptr_t)ctx.pc;
++            addr[na++] = (uintptr_t)ctx.lr;
++            for (unsigned d = 0; d < WPROF_CHAIN; d++) {
++                if ((fp & 15u) || fp < sp || fp >= sp + 0x1000000u) break;
++                const uintptr_t next = ((const uintptr_t*)fp)[0];
++                const uintptr_t ret  = ((const uintptr_t*)fp)[1];
++                if (!ret) break;
++                addr[na++] = ret;
++                if (next <= fp) break;
++                fp = next;
++            }
++        } else {
++            fails++;
++        }
++        if (svcSetThreadActivity(h, WPROF_RUNNABLE) != 0) fails++;
++        if (na) {
++            samples++;
++            wprof_hadd(s_wprof_xkey, s_wprof_xcnt, addr[0] - base);
++            for (unsigned i = 0; i < na; i++) {
++                int dup = 0;
++                for (unsigned j = 0; j < i; j++) if (addr[j] == addr[i]) { dup = 1; break; }
++                if (!dup) wprof_hadd(s_wprof_ikey, s_wprof_icnt, addr[i] - base);
++            }
++        }
++        nanosleep(&tick, NULL);
++    } while (get_timestamp_ns() < deadline);
++    fprintf(stderr, "[wprof] samples %llu fails %llu start_s %d secs %d base %p\n",
++            samples, fails, s_wprof_start_s, s_wprof_secs, (void*)base);
++    wprof_dump_top("X", s_wprof_xkey, s_wprof_xcnt, WPROF_TOP_X);
++    wprof_dump_top("I", s_wprof_ikey, s_wprof_icnt, WPROF_TOP_I);
++    fflush(stderr);
++    atomic_store(&s_wprof_state, 2);
++    return NULL;
++}
++static void wprof_note_walker(void)
++{
++    if (atomic_load_explicit(&s_wprof_state, memory_order_relaxed) != 0) return;
++    /* One caller arms it; that thread is the one sampled. */
++    int unset = 0;
++    if (!atomic_compare_exchange_strong(&s_wprof_state, &unset, 1)) return;
++    const char* e = getenv("RSX_WALKER_PROF");
++    if (!e || !*e) { atomic_store(&s_wprof_state, 2); return; }
++    int start_s = 0, secs = 0;
++    if (sscanf(e, "%d:%d", &start_s, &secs) < 1) { atomic_store(&s_wprof_state, 2); return; }
++    if (start_s < 0) start_s = 0;
++    if (secs <= 0) secs = 10;
++    s_wprof_start_s = start_s; s_wprof_secs = secs;
++    s_wprof_handle = threadGetCurHandle();
++    s_wprof_armed_ns = get_timestamp_ns();
++    pthread_t t;
++    if (pthread_create(&t, NULL, wprof_thread, NULL) != 0) {
++        fprintf(stderr, "[wprof] sampler thread not started\n");
++        atomic_store(&s_wprof_state, 2);
++        return;
++    }
++    pthread_detach(t);
++    fprintf(stderr, "[wprof] armed: start %d s, %d s, handle 0x%X\n", start_s, secs, s_wprof_handle);
++}
+ #else
+ static void wprof_note_walker(void) {}
+ #endif
+@@ -2180,6 +2319,15 @@ void cellGcm_rsx_process_fifo(void)
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_rsx_process_fifo_unlocked();
++    /* 58b: VK_DRAW_BATCH keeps draws in an open command buffer until 512 of
++     * them, a present or a readback. GoW3 hung with the PPU polling a u16 at
++     * 0x26D3D0 and the walker idle: submit what the pass recorded before the
++     * walker sleeps (no-op when nothing is pending). GCM_IDLE_FLUSH=0 skips it. */
++    {
++        static int idle_flush = -1;
++        if (idle_flush < 0) { const char* e = getenv("GCM_IDLE_FLUSH"); idle_flush = e ? atoi(e) : 1; }
++        if (idle_flush && rsx_draw_engine_enabled()) rsx_draw_engine_flush();
++    }
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     if (ft_t0) {
+         const uint64_t t1 = ps3_ft_now();
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index f78c66f..5b9f5f9 100644
+index f78c66f2..5b9f5f9c 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -58,6 +58,21 @@
@@ -235,7 +568,7 @@ index f78c66f..5b9f5f9 100644
 +
  #endif /* !_WIN32 */
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index 37e3745..f1654f2 100644
+index 37e37454..2c73466d 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
 @@ -341,7 +341,9 @@ static void cellFsOpen(ppu_context* ctx)
@@ -280,11 +613,218 @@ index 37e3745..f1654f2 100644
  static void cellFsFsync(ppu_context* ctx)
  {
      int fd = (int)(uint32_t)ctx->gpr[3];
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index ea7de18a..84c71d52 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -942,6 +942,18 @@ extern "C" void ppu_resv_register(ppu_context* c)
+  * while calling out every pass. Reading a pinned lr as "no calls since
+  * entry" narrowed a search to the wrong loop once already. lr names the
+  * last DIRECT call site and nothing more. */
++/* Sampling-profiler hook: last direct-call lr of guest thread `tid` (0 if
++ * none). Same unlocked best-effort read as below. */
++extern "C" uint32_t ppu_guest_lr_of(unsigned tid)
++{
++    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    for (long i = 0; i < n; i++) {
++        ppu_context* c = g_resv_ctxs[i];
++        if (c && (unsigned)c->thread_id == tid) return (uint32_t)c->lr;
++    }
++    return 0;
++}
++
+ extern "C" void ppu_report_guest_lrs(void)
+ {
+     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 84b7ac96..957a2aa1 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -40,6 +40,7 @@
+ #include <time.h>
+ #include "../platform/win32_compat.h"
+ #include "ps3emu/log_first.h"
++#include "ps3emu/spu_prof.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -1209,6 +1210,7 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
+ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+ {
+     if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
++    const uint64_t sp_old = sprof_push(SPROF_CHWAIT, channel, NULL);
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+ 
+     { static unsigned long bn = 0; unsigned long n = ++bn;
+@@ -1244,6 +1246,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+     }
+     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
+     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
++    sprof_pop(sp_old);
+     ctx->status = SPU_STATUS_RUNNING;
+ }
+ 
+@@ -2692,6 +2695,16 @@ void spu_indirect_branch(spu_context* ctx)
+      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
+      * masking is a no-op for already-valid targets. */
+     ctx->pc &= SPU_LS_MASK;
++    /* 35a: attribute job-buffer pcs to the resident jobmod overlay (ids 200+) */
++    { int _img = ctx->image_id;
++      if (ctx->pc >= 0x4000u) {
++          if (ctx->resident_ovl >= 200) _img = ctx->resident_ovl;
++          for (int _s = 0; _s < 4; _s++)
++              if (ctx->resident_code[_s].image_id >= 200 && ctx->pc >= ctx->resident_code[_s].lsa &&
++                  ctx->pc < ctx->resident_code[_s].lsa + ctx->resident_code[_s].size) {
++                  _img = ctx->resident_code[_s].image_id; break; }
++      }
++      sprof_branch(_img, ctx->pc); }
+     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
+      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
+      * enforce the preserve-all-registers hardware contract here -- the first
+@@ -2737,7 +2750,24 @@ void spu_indirect_branch(spu_context* ctx)
+               if (s_t && (n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 64)
+                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                           n, ctx->gpr[3]._u32[0]); }
+-            ctx->gpr[3] = spu_make_preferred_u32(0);
++            /* SPURS_POLL_CUR=<s>: after <s> seconds, answer the poll the way the
++             * real kernel does when nothing else should run -- (pollStatus << 16)
++             * | selected wid, with the module's own wklCurrentId (LS 0x1DC) and no
++             * status bits. Answering 0 tells a module whose wid is not 0 that
++             * workload 0 was picked, and a WWS job manager then leaves after one
++             * job. Unset keeps the old 0 (A/B: one run measures both). */
++            { static int s_pc = -2; static unsigned long long s_pc_t0;
++              if (s_pc == -2) { const char* e = getenv("SPURS_POLL_CUR");
++                                s_pc_t0 = GetTickCount64(); s_pc = e ? atoi(e) : -1; }
++              uint32_t ans = 0;
++              if (s_pc >= 0 && GetTickCount64() - s_pc_t0 >= (unsigned long long)s_pc * 1000ull) {
++                  const uint8_t* w = ctx->ls + 0x1DC;
++                  ans = ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3];
++                  ans &= 0xFFFFu;
++                  { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
++                      fprintf(stderr, "[spurs-pm] poll answers wklCurrentId=%u (SPURS_POLL_CUR)\n", ans); }
++              }
++              ctx->gpr[3] = spu_make_preferred_u32(ans); }
+             /* The kernel's selection copies the instance's first line into the
+              * context's tempArea (LS 0x100) on every call, not only at module
+              * entry, and jobs that ran since may have overwritten it. */
+@@ -3404,6 +3434,8 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
+             (unsigned long long)v._u64[1]);
+ }
+ 
++#include "spu_prof_impl.inc"
++
+ #ifdef __cplusplus
+ }
+ #endif
+\ No newline at end of file
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 6d63141f..0f93eb9b 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -9,6 +9,7 @@
+ #include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW */
+ #include "spu_interp.h"
+ #include "spu_helpers.h"
++#include "ps3emu/spu_prof.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -428,7 +429,7 @@ static void interp_stats_step(const spu_context* ctx)
+     s_is_tot = 0; s_is_t0 = now;
+ }
+ 
+-uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
++static uint32_t spu_interp_run_until_impl(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+     if (interp_stats_on()) {
+         /* Credit an entry inside a resident code region to the image that
+          * owns it, so the list names the lift that's missing the entry. */
+@@ -543,6 +544,13 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+     }
+ }
+ 
++uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
++    const uint64_t sp_old = sprof_push(SPROF_INTERP, 0, ctx);
++    const uint32_t r = spu_interp_run_until_impl(ctx, start_lsa, stop_lsa);
++    sprof_pop(sp_old);
++    return r;
++}
++
+ void spu_dispatch(spu_context* ctx, uint32_t target) {
+     for (;;) {
+         target &= 0x3FFFC;
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index f922b74..1190bd4 100644
+index f922b745..e00c3767 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -1021,7 +1021,48 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
+@@ -13,7 +13,11 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "ps3emu/log_first.h"
++#include "ps3emu/spu_prof.h"
+ #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
++#ifdef __SWITCH__
++#include <malloc.h>                /* mallinfo */
++#endif
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+@@ -394,8 +398,18 @@ typedef struct {
+     int                 have_r3;
+     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+     uint32_t            taskid;
++    uint64_t            t_enq_us;     /* SPU_TIMING: when it was dispatched */
+ } spu_async_job;
+ 
++/* SPU_TIMING diagnostic (GoW3 on Switch crawls at ~0.3 fps with the jobs
++ * draining): microseconds spent queued, waiting for the per-task LS lock, and
++ * running, per job. */
++static uint64_t spu_now_us(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++}
++
+ /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
+  * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
+  * shared taskset context in LS. Our default model runs each task ONCE on a
+@@ -649,6 +663,9 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
+ 
+ static void spu_async_run(spu_async_job* j)
+ {
++    const uint64_t t_start = spu_now_us();
++    uint64_t t_locked = t_start;
++    sprof_set(SPROF_RUN, (uint32_t)j->image_id);
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+@@ -661,8 +678,11 @@ static void spu_async_run(spu_async_job* j)
+ #ifdef _WIN32
+         AcquireSRWLockExclusive(&ts_slot->lock);   /* serialize this taskset */
+ #else
++        sprof_set(SPROF_LOCK, 0x7500u);   /* place 0x7500 = taskset LS lock */
+         pthread_mutex_lock(&ts_slot->lock);
++        sprof_set(SPROF_RUN, (uint32_t)j->image_id);
+ #endif
++        t_locked = spu_now_us();
+         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+         ls = ts_slot->ls;
+         { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
+@@ -1002,6 +1022,14 @@ static void spu_async_run(spu_async_job* j)
+         pthread_mutex_unlock(&ts_slot->lock);
+ #endif
+     }
++    { static int s_tn = 0; const int n = __atomic_fetch_add(&s_tn, 1, __ATOMIC_RELAXED);
++      if (n < 60 || (n % 25) == 0) {
++          const uint64_t t_end = spu_now_us();
++          fprintf(stderr, "[spu-time] #%d image=%d task=%u queued=%llu lockwait=%llu run=%llu us\n",
++                  n, j->image_id, j->taskid,
++                  (unsigned long long)(j->t_enq_us && t_start > j->t_enq_us ? t_start - j->t_enq_us : 0),
++                  (unsigned long long)(t_locked - t_start), (unsigned long long)(t_end - t_locked));
++      } }
+     free(j);
+ }
+ 
+@@ -1021,7 +1049,122 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      return 0;
  }
  #else
@@ -299,6 +839,15 @@ index f922b74..1190bd4 100644
 +static spu_async_job* s_async_defer[256];
 +static unsigned s_async_defer_head, s_async_defer_count;
 +static volatile int s_async_live;
++#ifdef __SWITCH__
++/* s_async_live at the last failed create (0 = none). Three doomed
++ * pthread_create attempts cost ~300 ms on an exhausted heap and the PPU sat
++ * in cellSpursCreateTask2 for all of it; past that count, go straight to the
++ * drain workers. */
++static volatile int s_create_fail_live;
++static unsigned s_create_skipped;
++#endif
++static pthread_cond_t s_async_defer_cond = PTHREAD_COND_INITIALIZER;
 +static int spu_async_defer_push(spu_async_job* j)
 +{
 +    int ok = 0;
@@ -307,6 +856,7 @@ index f922b74..1190bd4 100644
 +        s_async_defer[(s_async_defer_head + s_async_defer_count) % 256] = j;
 +        s_async_defer_count++;
 +        ok = 1;
++        pthread_cond_signal(&s_async_defer_cond);
 +    }
 +    pthread_mutex_unlock(&s_async_defer_lock);
 +    return ok;
@@ -326,15 +876,79 @@ index f922b74..1190bd4 100644
 +static void* spu_async_thread(void* p)
 +{
 +    __atomic_add_fetch(&s_async_live, 1, __ATOMIC_RELAXED);
-+    for (spu_async_job* j = (spu_async_job*)p; j; j = spu_async_defer_pop())
++    sprof_thread('T', p ? (uint32_t)((spu_async_job*)p)->image_id : 0);
++    for (spu_async_job* j = (spu_async_job*)p; j; j = spu_async_defer_pop()) {
 +        spu_async_run(j);
++        sprof_set(SPROF_OUT, 0);
++    }
++    sprof_thread_exit();
 +    __atomic_sub_fetch(&s_async_live, 1, __ATOMIC_RELAXED);
 +    return NULL;
 +}
++
++#ifdef __SWITCH__
++/* Horizon: once the process runs out of threads/heap, no new thread can be
++ * created, and a deferred job only ran when a live thread finished -- but the
++ * live ones are long loops (audio, MLAA) that never finish. These drain
++ * workers are created on the first dispatch, while there is still room, and
++ * block until a job is deferred. */
++#define SPU_DRAIN_WORKERS 3
++static void* spu_async_drain_thread(void* p)
++{
++    (void)p;
++    sprof_thread('D', 0);
++    for (;;) {
++        sprof_set(SPROF_IDLE, 0);
++        pthread_mutex_lock(&s_async_defer_lock);
++        while (!s_async_defer_count)
++            pthread_cond_wait(&s_async_defer_cond, &s_async_defer_lock);
++        spu_async_job* j = s_async_defer[s_async_defer_head];
++        s_async_defer_head = (s_async_defer_head + 1) % 256;
++        s_async_defer_count--;
++        pthread_mutex_unlock(&s_async_defer_lock);
++        spu_async_run(j);
++    }
++    return NULL;
++}
++static void spu_async_drain_start(void)
++{
++    static int s_started = 0;
++    if (__atomic_exchange_n(&s_started, 1, __ATOMIC_ACQ_REL)) return;
++    int made = 0;
++    for (int i = 0; i < SPU_DRAIN_WORKERS; i++) {
++        pthread_t th; pthread_attr_t attr;
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, 16u << 20);
++        if (pthread_create(&th, &attr, spu_async_drain_thread, NULL) == 0) {
++            pthread_detach(th); made++;
++        }
++        pthread_attr_destroy(&attr);
++    }
++    fprintf(stderr, "[spu_workload] %d/%d drain workers started\n", made, SPU_DRAIN_WORKERS);
++    { extern void spu_async_log_mem_early(void); spu_async_log_mem_early(); }
++}
++/* libnx svcGetInfo, declared by hand to keep <switch.h> out of this file. */
++extern uint32_t svcGetInfo(uint64_t* out, uint32_t id0, uint32_t handle, uint64_t id1);
++static void spu_async_log_mem(void)
++{
++    uint64_t total = 0, used = 0;
++    svcGetInfo(&total, 6, 0xFFFF8001u, 0);   /* InfoType_TotalMemorySize */
++    svcGetInfo(&used, 7, 0xFFFF8001u, 0);    /* InfoType_UsedMemorySize */
++    fprintf(stderr, "[spu_workload] process memory: used %llu MB of %llu MB (free %llu MB)\n",
++            (unsigned long long)(used >> 20), (unsigned long long)(total >> 20),
++            (unsigned long long)((total - used) >> 20));
++    /* libnx hands the whole free memory to newlib as heap at boot, so "used"
++     * above is always ~total: what malloc really has left is fordblks. */
++    struct mallinfo mi = mallinfo();
++    fprintf(stderr, "[spu_workload] malloc heap: arena %zu MB, in use %zu MB, free %zu MB\n",
++            (size_t)mi.arena >> 20, (size_t)mi.uordblks >> 20, (size_t)mi.fordblks >> 20);
++}
++void spu_async_log_mem_early(void) { spu_async_log_mem(); }
++#endif
  #endif
  
  int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
-@@ -1351,6 +1392,33 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
+@@ -1351,6 +1494,33 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
      spu_lockline_unlock();
  }
  
@@ -368,7 +982,7 @@ index f922b74..1190bd4 100644
  /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by
   * guest SPU/PPU atomics that bypass spu_taskset_signal_task. Coherence calls
   * this with lock-line held; the guest bit remains the only predicate. */
-@@ -1530,23 +1598,26 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1530,23 +1700,27 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      spu_lockline_lock();
      spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
      spu_lockline_unlock();
@@ -376,6 +990,7 @@ index f922b74..1190bd4 100644
 +     * s_sig_lock: lock-line must not nest in it). Sleep only after re-testing
 +     * the bit under s_sig_lock: the signaller sets the bit first and then
 +     * broadcasts under s_sig_lock, so no wake is lost between the two. */
++    const uint64_t sp_old = sprof_push(SPROF_SIGWAIT, taskId, NULL);
 +    while (!spu_signalled_take(taskset_ea, taskId)) {
 +        int timed_out = 0;
  #ifdef _WIN32
@@ -410,12 +1025,13 @@ index f922b74..1190bd4 100644
              static int _n = 0;
              if (++secs && _n < 16) { _n++;
                  fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
-@@ -1554,13 +1625,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1554,13 +1728,11 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
              if (drain && secs >= drain) { drained = 1; break; }
          }
      }
 -    pthread_mutex_unlock(&s_sig_lock);
 -#endif
++    sprof_pop(sp_old);
      spu_lockline_lock();
      spu_coh_watch_remove(&watch);
      spu_lockline_unlock();
@@ -425,7 +1041,15 @@ index f922b74..1190bd4 100644
      if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
          fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                  "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
-@@ -1679,11 +1747,16 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+@@ -1612,6 +1784,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+     if (!j) return 0;
+     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
+     j->fn = fn; j->image_id = image_id;
++    j->t_enq_us = spu_now_us();
+     /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
+      * set the globals for THIS task). Reading them later in the async thread races
+      * the next CreateTask overwriting the single-slot globals -- with two audio
+@@ -1679,19 +1852,59 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
       * mmap'd and committed on touch, so this reserves address space rather
       * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
       * the guard page above. */
@@ -436,14 +1060,32 @@ index f922b74..1190bd4 100644
 +#endif
      pthread_t th;
      pthread_attr_t attr;
++#ifdef __SWITCH__
++    spu_async_drain_start();
++    if (s_create_fail_live > 0 && s_async_live >= s_create_fail_live &&
++        spu_async_defer_push(j)) {
++        const unsigned n = __atomic_add_fetch(&s_create_skipped, 1, __ATOMIC_RELAXED);
++        if (n <= 3 || (n % 200) == 0)
++            fprintf(stderr, "[spu_workload] create skipped (live=%d >= fail_live=%d) "
++                    "image=%d task=%u -> drain queue (#%u)\n", s_async_live,
++                    s_create_fail_live, j->image_id, j->taskid, n);
++        return 1;
++    }
++    const uint64_t t_c0 = spu_now_us();
++#endif
      pthread_attr_init(&attr);
      int prc = EINVAL;
 -    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
 +    if (pthread_attr_setstacksize(&attr, SPU_ASYNC_STACK_BYTES) == 0)
          prc = pthread_create(&th, &attr, spu_async_thread, j);
++#ifdef __SWITCH__
++    /* Middle step before the tiny default stack. */
++    if (prc != 0 && pthread_attr_setstacksize(&attr, 4u << 20) == 0)
++        prc = pthread_create(&th, &attr, spu_async_thread, j);
++#endif
      pthread_attr_destroy(&attr);
      /* A host that will not reserve that much still gets the thread, on the
-@@ -1691,7 +1764,17 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * default stack: a shallow SPU job runs there, and a deep one dying
       * beats never dispatching at all. */
      if (prc != 0)
          prc = pthread_create(&th, NULL, spu_async_thread, j);
@@ -455,6 +1097,13 @@ index f922b74..1190bd4 100644
 +            fprintf(stderr, "[spu_workload] async thread create FAILED rc=%d (live=%d) image=%d "
 +                            "task=%u -> %s\n", prc, s_async_live, j->image_id, j->taskid,
 +                    queued ? "deferred to the next finishing thread" : "DROPPED (defer queue full)");
++#ifdef __SWITCH__
++        s_create_fail_live = s_async_live > 0 ? s_async_live : 1;
++        if (s_fail_log < 20 || (s_fail_log % 100) == 0)
++            fprintf(stderr, "[spu-time] failed create attempts took %llu us\n",
++                    (unsigned long long)(spu_now_us() - t_c0));
++        if (s_fail_log == 0 || (s_fail_log % 100) == 0) spu_async_log_mem();
++#endif
 +        s_fail_log++;
 +        if (!queued) { free(j); return 0; }
 +        return 1;
@@ -463,10 +1112,18 @@ index f922b74..1190bd4 100644
  #endif
      return 1;
 diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
-index b997931..ef9fe33 100644
+index b997931b..f4009aca 100644
 --- a/runtime/syscalls/sys_ppu_thread.c
 +++ b/runtime/syscalls/sys_ppu_thread.c
-@@ -36,7 +36,13 @@ static PPU_TLS int     s_exit_armed = 0;
+@@ -24,6 +24,7 @@ static PPU_TLS int     s_exit_armed = 0;
+ #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
+ #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+ #include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
++#include "ps3emu/spu_prof.h"             /* SPU_PROF: PPU threads' CPU per core too */
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
+@@ -36,7 +37,13 @@ static PPU_TLS int     s_exit_armed = 0;
  /* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
   * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
   * down; keep the two in step so a stack-depth bug reproduces on both. */
@@ -480,3 +1137,379 @@ index b997931..ef9fe33 100644
  
  #ifdef _WIN32
  #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
+@@ -197,6 +204,7 @@ static void* ppu_host_thread_proc(void* param)
+      * reservation and prevents ABA corruption of the guest's lock-free lists. */
+     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
++    sprof_thread('P', (uint32_t)info->ctx.thread_id);
+ 
+     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
+             (unsigned long long)info->ctx.thread_id,
+@@ -330,6 +338,7 @@ uint64_t ppu_thread_register_main(void)
+         strncpy(t->name, "main", sizeof(t->name) - 1);
+         ps3_ft_name(1, "main");
+         ps3_tprof_thread('P', 1);
++        sprof_thread('P', 1);
+         ps3_thread_name("ppu main");      /* registered from the boot thread itself */
+ #ifdef _WIN32
+         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+diff --git a/include/ps3emu/spu_prof.h b/include/ps3emu/spu_prof.h
+new file mode 100644
+index 00000000..48bb9d3a
+--- /dev/null
++++ b/include/ps3emu/spu_prof.h
+@@ -0,0 +1,91 @@
++/* SPU_PROF=<seconds>: where the SPU-side host threads spend wall time.
++ *
++ * Every 2 ms a sampler reads one state word per registered thread (SPURS
++ * policy-module workers 'W', the SPURS kernel coordinator 'K', async task
++ * threads 'T', drain workers 'D') and every <seconds> prints, per thread, the
++ * share of each state and the top places:
++ *   idle      waiting for a dispatch
++ *   dispatch  bookkeeping between a wake and the module run
++ *   run       in lifted code (place = last indirect-branch target)
++ *   interp    in the SPU interpreter (place = image, 1 KB page of local store)
++ *   chwait    blocked reading a channel (place = channel)
++ *   lock      waiting for a host lock
++ *   sigwait   a task waiting for its taskset signal
++ *   ksleep / kscan   the kernel coordinator's timed wait / workload scan
++ * plus, per workload, how long a policy-module run waited between the kernel
++ * marking its slot busy and the worker starting it, and how long it ran.
++ *
++ * Unset, every hook is one thread-local load. POSIX hosts only. */
++#ifndef PS3EMU_SPU_PROF_H
++#define PS3EMU_SPU_PROF_H
++#include <stdint.h>
++
++enum { SPROF_OUT = 0, SPROF_IDLE, SPROF_DISPATCH, SPROF_RUN, SPROF_INTERP,
++       SPROF_CHWAIT, SPROF_LOCK, SPROF_SIGWAIT, SPROF_KSLEEP, SPROF_KSCAN,
++       SPROF_NSTATES };
++
++#ifdef _WIN32
++static inline void     sprof_thread(char k, uint32_t w) { (void)k; (void)w; }
++static inline void     sprof_thread_exit(void) {}
++static inline void     sprof_set(uint32_t st, uint32_t arg) { (void)st; (void)arg; }
++static inline uint64_t sprof_push(uint32_t st, uint32_t arg, void* ctx) { (void)st; (void)arg; (void)ctx; return 0; }
++static inline void     sprof_pop(uint64_t o) { (void)o; }
++static inline void     sprof_branch(int img, uint32_t pc) { (void)img; (void)pc; }
++static inline uint64_t sprof_now_us(void) { return 0; }
++static inline void     sprof_pm_run(uint32_t wid, uint64_t w, uint64_t r, unsigned p) { (void)wid; (void)w; (void)r; (void)p; }
++static inline void     sprof_kernel_pass(int k) { (void)k; }
++static inline void     sprof_kernel_dispatch(int k) { (void)k; }
++#else
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct sprof_slot {
++    volatile uint32_t st, arg;
++    void* volatile    ctx;        /* spu_context of the last interpreter entry */
++    volatile uint32_t br_pc;      /* last indirect-branch target since the run began */
++    volatile int      br_img;
++    volatile int      used;
++    char              kind;
++    uint32_t          who;
++    uint32_t          nxh;        /* Switch: thread handle, for its CPU ticks */
++    int               tick_ok;    /* tick holds a reading */
++    uint64_t          tick;       /* CPU ticks at the last report */
++} sprof_slot;
++extern __thread sprof_slot* t_sprof;
++
++void     sprof_thread(char kind, uint32_t who);   /* register the calling thread */
++void     sprof_thread_exit(void);
++uint64_t sprof_now_us(void);                      /* 0 when the profiler is off */
++void     sprof_pm_run(uint32_t wid, uint64_t wake_us, uint64_t run_us, unsigned polls);
++void     sprof_kernel_pass(int kick_pass);
++void     sprof_kernel_dispatch(int kicked);
++
++static inline void sprof_set(uint32_t st, uint32_t arg)
++{
++    sprof_slot* s = t_sprof;
++    if (s) { s->arg = arg; s->br_pc = 0; s->st = st; }
++}
++static inline uint64_t sprof_push(uint32_t st, uint32_t arg, void* ctx)
++{
++    sprof_slot* s = t_sprof;
++    if (!s) return 0;
++    const uint64_t old = ((uint64_t)s->st << 32) | s->arg;
++    if (ctx) s->ctx = ctx;
++    s->arg = arg; s->st = st;
++    return old;
++}
++static inline void sprof_pop(uint64_t old)
++{
++    sprof_slot* s = t_sprof;
++    if (s) { s->arg = (uint32_t)old; s->st = (uint32_t)(old >> 32); }
++}
++static inline void sprof_branch(int img, uint32_t pc)
++{
++    sprof_slot* s = t_sprof;
++    if (s) { s->br_img = img; s->br_pc = pc; }
++}
++#ifdef __cplusplus
++}
++#endif
++#endif /* _WIN32 */
++#endif
+diff --git a/runtime/spu/spu_prof_impl.inc b/runtime/spu/spu_prof_impl.inc
+new file mode 100644
+index 00000000..af518299
+--- /dev/null
++++ b/runtime/spu/spu_prof_impl.inc
+@@ -0,0 +1,257 @@
++/* SPU_PROF sampler and counters (see include/ps3emu/spu_prof.h). Included at
++ * the end of spu_channels.c, which has spu_context. POSIX hosts only. */
++#ifndef _WIN32
++#include <pthread.h>
++#include <unistd.h>
++#include <string.h>
++#include <time.h>
++
++enum { SPROF_SLOTS = 96, SPROF_KEYS = 2048, SPROF_WIDS = 32 };
++
++/* Switch: real CPU time per thread (svcGetInfo ThreadTickCount, subtype -1:
++ * mesosphere returns 0 for the per-core subtypes) and busy % per core
++ * (IdleTickCount, readable only for the caller's own core, so the sampler
++ * visits each core). Declared here instead of including <switch.h> (its
++ * u8..u64 clash with the runtime's). */
++#ifdef __SWITCH__
++extern uint32_t svcGetInfo(uint64_t* out, uint32_t id0, uint32_t handle, uint64_t id1);
++extern uint32_t threadGetCurHandle(void);
++extern uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferred_core, uint32_t affinity_mask);
++extern uint32_t svcGetThreadCoreMask(int32_t* preferred_core, uint64_t* affinity_mask, uint32_t handle);
++extern uint32_t svcGetCurrentProcessorNumber(void);
++extern uint64_t svcGetSystemTick(void);
++extern void     svcSleepThread(int64_t nano);
++#define SPROF_TICK_HZ 19200000.0
++#define SPROF_CUR_THREAD 0xFFFF8000u
++static int sprof_ticks(uint32_t h, uint64_t* out)
++{
++    static int s_warned;
++    const uint32_t rc = h ? svcGetInfo(out, 25u /* ThreadTickCount (13.0.0+; 0xF0000002 was removed) */, h, ~0ull) : 0xFFFFFFFFu;
++    if (rc && !s_warned) {
++        s_warned = 1;
++        uint64_t self = 0;
++        const uint32_t rc_self = svcGetInfo(&self, 25u, SPROF_CUR_THREAD, ~0ull);
++        fprintf(stderr, "[sprof] ThreadTickCount failed: rc=0x%X h=0x%X (own pseudo-handle: rc=0x%X ticks=%llu, own handle 0x%X)\n",
++                rc, h, rc_self, (unsigned long long)self, threadGetCurHandle());
++    }
++    return rc == 0;
++}
++static uint64_t s_idle_last[4], s_idle_at[4];
++/* Busy % of each core since the last call, counting every thread of every
++ * process; -1 when the core cannot be visited (core 3 is the system's). */
++static void sprof_core_load(double load[4])
++{
++    int32_t pref; uint64_t mask;
++    for (unsigned c = 0; c < 4; c++) load[c] = -1;
++    if (svcGetThreadCoreMask(&pref, &mask, SPROF_CUR_THREAD) != 0) return;
++    for (unsigned c = 0; c < 4; c++) {
++        if (svcSetThreadCoreMask(SPROF_CUR_THREAD, (int32_t)c, 1u << c) != 0) continue;
++        for (int i = 0; i < 50 && svcGetCurrentProcessorNumber() != c; i++) svcSleepThread(-1);
++        if (svcGetCurrentProcessorNumber() != c) continue;
++        uint64_t idle;
++        if (svcGetInfo(&idle, 10 /* IdleTickCount */, 0, ~0ull) != 0) continue;
++        const uint64_t now = svcGetSystemTick();
++        if (s_idle_at[c] && now > s_idle_at[c] && idle >= s_idle_last[c])
++            load[c] = 100.0 * (1.0 - (double)(idle - s_idle_last[c]) / (double)(now - s_idle_at[c]));
++        s_idle_last[c] = idle; s_idle_at[c] = now;
++    }
++    svcSetThreadCoreMask(SPROF_CUR_THREAD, pref, (uint32_t)mask);
++}
++#endif
++__thread sprof_slot* t_sprof;
++static sprof_slot s_sprof[SPROF_SLOTS];
++static int s_sprof_period = -1;                 /* -1 = environment not read */
++static pthread_mutex_t s_sprof_reg = PTHREAD_MUTEX_INITIALIZER;
++
++static uint64_t s_sp_runs[SPROF_WIDS], s_sp_empty[SPROF_WIDS], s_sp_wake[SPROF_WIDS],
++                s_sp_wake_max[SPROF_WIDS], s_sp_wake_slow[SPROF_WIDS], s_sp_run[SPROF_WIDS],
++                s_sp_run_max[SPROF_WIDS];
++static uint64_t s_sp_pass, s_sp_kickpass, s_sp_disp, s_sp_disp_probe;
++
++#define SP_ADD(v, n) __atomic_fetch_add(&(v), (uint64_t)(n), __ATOMIC_RELAXED)
++#define SP_TAKE(v)   __atomic_exchange_n(&(v), (uint64_t)0, __ATOMIC_RELAXED)
++
++static uint64_t sprof_clock_us(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
++}
++uint64_t sprof_now_us(void) { return s_sprof_period > 0 ? sprof_clock_us() : 0; }
++
++void sprof_pm_run(uint32_t wid, uint64_t wake_us, uint64_t run_us, unsigned polls)
++{
++    if (s_sprof_period <= 0 || wid >= SPROF_WIDS) return;
++    if (wake_us > 10000000ull) wake_us = 0;     /* no stamp yet */
++    SP_ADD(s_sp_runs[wid], 1); SP_ADD(s_sp_wake[wid], wake_us); SP_ADD(s_sp_run[wid], run_us);
++    if (!polls) SP_ADD(s_sp_empty[wid], 1);
++    if (wake_us > 2000) SP_ADD(s_sp_wake_slow[wid], 1);
++    if (wake_us > s_sp_wake_max[wid]) s_sp_wake_max[wid] = wake_us;   /* racy maxima: a diagnostic */
++    if (run_us > s_sp_run_max[wid]) s_sp_run_max[wid] = run_us;
++}
++void sprof_kernel_pass(int kick_pass)
++{
++    if (s_sprof_period <= 0) return;
++    SP_ADD(s_sp_pass, 1); if (kick_pass) SP_ADD(s_sp_kickpass, 1);
++}
++void sprof_kernel_dispatch(int kicked)
++{
++    if (s_sprof_period <= 0) return;
++    SP_ADD(s_sp_disp, 1); if (!kicked) SP_ADD(s_sp_disp_probe, 1);
++}
++
++static void* sprof_sampler(void* p)
++{
++    (void)p;
++    static uint64_t key[SPROF_KEYS]; static uint32_t hit[SPROF_KEYS];
++    static uint32_t tot[SPROF_SLOTS], by[SPROF_SLOTS][SPROF_NSTATES];
++    static const char* const nm[SPROF_NSTATES] = { "out", "idle", "dispatch", "run", "interp",
++        "chwait", "lock", "sigwait", "ksleep", "kscan" };
++    for (;;) {
++        memset(key, 0, sizeof key); memset(hit, 0, sizeof hit);
++        memset(tot, 0, sizeof tot); memset(by, 0, sizeof by);
++        const uint64_t t0 = sprof_clock_us();
++        while (sprof_clock_us() - t0 < (uint64_t)s_sprof_period * 1000000ull) {
++            usleep(2000);
++            for (unsigned k = 0; k < SPROF_SLOTS; k++) {
++                sprof_slot* s = &s_sprof[k];
++                if (!s->used) continue;
++                const uint32_t st = s->st;
++                if (st >= SPROF_NSTATES) continue;
++                tot[k]++; by[k][st]++;
++                uint32_t img = 0, pc = 0;
++                if (st == SPROF_INTERP) {
++                    const spu_context* c = (const spu_context*)s->ctx;
++                    if (!c) continue;
++                    img = (uint32_t)c->image_id; pc = c->pc & 0x3FC00u;
++                    /* 35a: name the resident jobmod overlay (ids 200+) for job-buffer pcs */
++                    if (c->resident_ovl >= 200 && (c->pc & 0x3FFFFu) >= 0x4000u) img = (uint32_t)c->resident_ovl;
++                    for (int _s = 0; _s < 4; _s++) {
++                        uint32_t _p = c->pc & 0x3FFFFu;
++                        if (c->resident_code[_s].image_id >= 200 && _p >= c->resident_code[_s].lsa &&
++                            _p < c->resident_code[_s].lsa + c->resident_code[_s].size) {
++                            img = (uint32_t)c->resident_code[_s].image_id; break; }
++                    }
++                } else if (st == SPROF_RUN) {
++                    pc = s->br_pc; img = pc ? (uint32_t)s->br_img : s->arg;
++                } else if (st == SPROF_CHWAIT || st == SPROF_LOCK) {
++                    pc = s->arg;
++                } else continue;
++                const uint64_t kk = ((uint64_t)k << 58) | ((uint64_t)st << 54) |
++                                    ((uint64_t)img << 22) | (pc & 0x3FFFFFu);
++                unsigned i = (unsigned)((kk * 0x9E3779B97F4A7C15ull) >> 53) % SPROF_KEYS, n;
++                for (n = 0; n < SPROF_KEYS && key[i] && key[i] != kk; n++) i = (i + 1) % SPROF_KEYS;
++                if (n == SPROF_KEYS) continue;
++                key[i] = kk; hit[i]++;
++            }
++        }
++        const double secs = (double)(sprof_clock_us() - t0) / 1e6;
++        fprintf(stderr, "[sprof] %.1f s\n", secs);
++#ifdef __SWITCH__
++        double reg_tot = 0;
++#endif
++        for (unsigned k = 0; k < SPROF_SLOTS; k++) {
++            if (!tot[k]) continue;
++            char line[256]; int o = 0;
++            double cpu_all = 0;
++#ifdef __SWITCH__
++            {
++                uint64_t t;
++                if (sprof_ticks(s_sprof[k].nxh, &t)) {
++                    if (s_sprof[k].tick_ok && t >= s_sprof[k].tick)
++                        cpu_all = 100.0 * (double)(t - s_sprof[k].tick) / (SPROF_TICK_HZ * secs);
++                    s_sprof[k].tick = t; s_sprof[k].tick_ok = 1;
++                    reg_tot += cpu_all;
++                }
++            }
++#endif
++            if (s_sprof[k].kind == 'P') {              /* PPU threads: CPU only, when it matters */
++                if (cpu_all >= 1.0)
++                    fprintf(stderr, "[sprof] P%u (slot %u): cpu %.1f\n", s_sprof[k].who, k, cpu_all);
++                continue;
++            }
++            for (unsigned st = 0; st < SPROF_NSTATES && o < 220; st++)
++                if (by[k][st])
++                    o += snprintf(line + o, sizeof line - (size_t)o, " %s %.1f", nm[st], 100.0 * by[k][st] / tot[k]);
++            fprintf(stderr, "[sprof] %c%u (slot %u, %u smp):%s | cpu %.1f\n",
++                    s_sprof[k].kind, s_sprof[k].who, k, tot[k], line, cpu_all);
++            for (int r = 0; r < 6; r++) {
++                unsigned best = 0, bi = 0;
++                for (unsigned i = 0; i < SPROF_KEYS; i++)
++                    if ((key[i] >> 58) == k && hit[i] > best) { best = hit[i]; bi = i; }
++                if (!best || best * 200 < tot[k]) break;       /* under 0.5 % */
++                fprintf(stderr, "[sprof]     %5.1f%%  %s img=0x%X pc=0x%05X\n", 100.0 * best / tot[k],
++                        nm[(key[bi] >> 54) & 15], (unsigned)((key[bi] >> 22) & 0xFFFFFFFFu),
++                        (unsigned)(key[bi] & 0x3FFFFFu));
++                hit[bi] = 0;
++            }
++        }
++#ifdef __SWITCH__
++        {
++            double ld[4];
++            sprof_core_load(ld);
++            fprintf(stderr, "[sprof] cores busy (all threads): c0 %.1f c1 %.1f c2 %.1f c3 %.1f | registered threads cpu sum %.1f\n",
++                    ld[0], ld[1], ld[2], ld[3], reg_tot);
++        }
++#endif
++        for (unsigned w = 0; w < SPROF_WIDS; w++) {
++            const uint64_t runs = SP_TAKE(s_sp_runs[w]);
++            const uint64_t empty = SP_TAKE(s_sp_empty[w]), wake = SP_TAKE(s_sp_wake[w]),
++                           slow = SP_TAKE(s_sp_wake_slow[w]), run = SP_TAKE(s_sp_run[w]),
++                           wmax = SP_TAKE(s_sp_wake_max[w]), rmax = SP_TAKE(s_sp_run_max[w]);
++            if (!runs) continue;
++            fprintf(stderr, "[sprof] pm wid=%u: %.0f runs/s (%.0f%% found no work), wake avg %llu us max %llu us"
++                            " (%llu over 2 ms), run avg %llu us max %llu us, %.1f%% of a thread\n",
++                    w, (double)runs / secs, 100.0 * (double)empty / (double)runs,
++                    (unsigned long long)(wake / runs), (unsigned long long)wmax, (unsigned long long)slow,
++                    (unsigned long long)(run / runs), (unsigned long long)rmax,
++                    (double)run / (secs * 1e4));
++        }
++        { const uint64_t pass = SP_TAKE(s_sp_pass), kp = SP_TAKE(s_sp_kickpass),
++                         d = SP_TAKE(s_sp_disp), dp = SP_TAKE(s_sp_disp_probe);
++          fprintf(stderr, "[sprof] kernel: %.0f passes/s (%.0f kick), %.0f dispatches/s (%.0f by idle probe)\n",
++                  (double)pass / secs, (double)kp / secs, (double)d / secs, (double)dp / secs); }
++        fflush(stderr);
++    }
++    return NULL;
++}
++
++void sprof_thread(char kind, uint32_t who)
++{
++    if (s_sprof_period < 0) {
++        pthread_mutex_lock(&s_sprof_reg);
++        if (s_sprof_period < 0) {
++            const char* e = getenv("SPU_PROF");
++            int period = e ? atoi(e) : 0;
++            if (period > 0) {
++                pthread_t th;
++                if (pthread_create(&th, NULL, sprof_sampler, NULL) == 0) pthread_detach(th);
++                else period = 0;
++            }
++            s_sprof_period = period > 0 ? period : 0;
++        }
++        pthread_mutex_unlock(&s_sprof_reg);
++    }
++    if (s_sprof_period <= 0 || t_sprof) return;
++    pthread_mutex_lock(&s_sprof_reg);
++    for (unsigned k = 0; k < SPROF_SLOTS; k++)
++        if (!s_sprof[k].used) {
++            sprof_slot* s = &s_sprof[k];
++            s->st = SPROF_OUT; s->arg = 0; s->ctx = NULL; s->br_pc = 0;
++            s->kind = kind; s->who = who;
++            s->tick = 0; s->tick_ok = 0;
++#ifdef __SWITCH__
++            s->nxh = threadGetCurHandle();
++#endif
++            s->used = 1;
++            t_sprof = s;
++            break;
++        }
++    pthread_mutex_unlock(&s_sprof_reg);
++}
++
++void sprof_thread_exit(void)
++{
++    sprof_slot* s = t_sprof;
++    if (s) { t_sprof = NULL; s->used = 0; }
++}
++#endif /* !_WIN32 */

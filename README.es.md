@@ -14,14 +14,22 @@ dibuja con un backend Vulkan que corre sobre NVK (Mesa). Los shaders del RSX se 
 
 ## Estado
 
-**En desarrollo, todavía no es jugable. Progreso general: ~20 %.**
+> [!IMPORTANT]
+> **Pausa hasta la próxima semana:** se me acabaron los tokens de la IA con la que desarrollo el port; se renuevan la
+> semana que viene y ahí sigo. El plan está en [PORT_STATUS.md](PORT_STATUS.md).
+
+**Último avance (13/11):** de ~1,9 a **~3 FPS (con OC)** con MLAA off, caché de la LUT de color grading y backoff del
+PPU. El cuello ya no son las SPU: es el hilo del RSX, que hace submit + espera de fence por cada draw. Se está
+probando el draw batching. Probabilidad estimada de 30 FPS sin OC: ~10 %; de 15-20 FPS: ~30-40 %.
+
+**En desarrollo, todavía no es jugable. Progreso general: ~25 %.**
 
 ```text
 Material y análisis      ██████████  100 %
 Arranque (boot → menú)   ██████░░░░   60 %
 Gráficos (RSX → Vulkan)  ███▌░░░░░░   35 %
 Capa Switch (Horizon)    █████▌░░░░   55 %
-Rendimiento (30 FPS)     ▌░░░░░░░░░    5 %
+Rendimiento (30 FPS)     █░░░░░░░░░   10 %
 Juego completo           ░░░░░░░░░░    0 %
 Traducción completa      ░░░░░░░░░░    0 %
 ```
@@ -30,9 +38,8 @@ En la consola, con los relojes de fábrica y sin overclock: arranca, lee los PSA
 muestra los logos y créditos del estudio (~45 FPS), reproduce el video de intro y dibuja la **pantalla de
 calibración de brillo** con los shaders del juego (32 de 32 pipelines bien).
 
-**Dónde está trabado:** a partir del video baja a ~4 FPS y después se queda casi quieto. Algunos jobs SPU no llegan
-a correr porque la creación de hilos se queda sin memoria (ENOMEM con 6 hilos de 16 MB de stack). El pad todavía no
-pasa de la pantalla de brillo.
+**Dónde está trabado:** pasada la intro corre a ~3 FPS (con OC). El cuello es el hilo del RSX (backend Vulkan), que
+espera a la GPU por cada draw; con el draw batching se colgó en el flip 870 y el arreglo está sin probar.
 
 **Objetivos:**
 - **30 FPS sin overclock.** Es la meta más difícil: el juego usa mucho las 6 SPU y en la Switch eso corre en 3

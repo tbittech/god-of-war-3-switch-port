@@ -14,14 +14,22 @@ by a Vulkan backend running on NVK (Mesa). RSX shaders are translated to SPIR-V 
 
 ## Status
 
-**Work in progress, not playable yet. Overall progress: ~20%.**
+> [!IMPORTANT]
+> **Paused until next week:** I ran out of tokens for the AI I use to develop this port; they renew next week and work
+> resumes then. The plan is in [PORT_STATUS.md](PORT_STATUS.md).
+
+**Latest (Nov 13):** from ~1.9 to **~3 FPS (overclocked)** with MLAA off, a cache for the color-grading LUT and a PPU
+wait backoff. The bottleneck is no longer the SPUs but the RSX thread, which submits and waits on a fence for every
+draw; draw batching is being tested. Estimated odds: 30 FPS without OC ~10 %, 15-20 FPS ~30-40 %.
+
+**Work in progress, not playable yet. Overall progress: ~25%.**
 
 ```text
 Material & analysis      ██████████  100 %
 Boot (boot → menu)       ██████░░░░   60 %
 Graphics (RSX → Vulkan)  ███▌░░░░░░   35 %
 Switch layer (Horizon)   █████▌░░░░   55 %
-Performance (30 FPS)     ▌░░░░░░░░░    5 %
+Performance (30 FPS)     █░░░░░░░░░   10 %
 Full game                ░░░░░░░░░░    0 %
 Full translation         ░░░░░░░░░░    0 %
 ```
@@ -30,9 +38,8 @@ On the console, at stock clocks with no overclock, it boots, reads the PSARCs, r
 studio logos and credits (~45 FPS), plays the intro video and draws the **brightness calibration screen** with the
 game's own shaders (32 of 32 pipelines OK).
 
-**Where it is stuck:** from the video on, it drops to ~4 FPS and then nearly stalls. Some SPU jobs never run because
-thread creation runs out of memory (ENOMEM with 6 threads using 16 MB stacks). The pad does not get past the
-brightness screen yet.
+**Where it is stuck:** past the intro it runs at ~3 FPS (overclocked). The bottleneck is the RSX thread (Vulkan
+backend), which waits on the GPU for every draw; with draw batching it hung at flip 870 and the fix is untested.
 
 **Goals:**
 - **30 FPS without overclock.** This is the hardest one: the game leans heavily on all 6 SPUs, which run on 3 A57

@@ -99,6 +99,7 @@ extern int32_t g_sys_process_exit_code;
 
 /* Host-provided symbols the runtime and the HLE libraries link against. */
 uint8_t* vm_base = nullptr;
+int g_gow3_disable_mlaa = 0;   /* 50a: read by func_00230DC4 (ppu_recomp_004.cpp) */
 extern uint32_t ppu_vm_size;                  /* ppu_loader.cpp: the OOB guard */
 
 /* Guest-callback dispatch. g_ps3_guest_caller is the hook the HLE runtime
@@ -442,8 +443,34 @@ static void env_default(const char* name, const char* value)
  * Run 9 stood at a self-JUMP park right after a SET_REFERENCE (an EDGE
  * command-buffer hole an SPU job fills); the runtime's 50 ms grace resynced
  * past it and no flip followed. */
+/* 50a: KEY=VALUE lines from sdmc:/switch/gow3-nx/env.txt win over the
+ * defaults below, so an A/B needs no rebuild ('#' starts a comment). */
+static void env_file_load(void)
+{
+#ifdef __SWITCH__
+    FILE* f = fopen(GOW3_NX_DIR "/env.txt", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* v = eq + 1;
+        size_t n = strlen(v);
+        while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
+        setenv(p, v, 1);
+        printf("[env] %s=%s (env.txt)\n", p, v);
+    }
+    fclose(f);
+#endif
+}
+
 static void title_environment(void)
 {
+    env_file_load();
     env_default("GCM_FLIPCB_ONTICK", "1");
     env_default("GCM_PARK_GRACE_MS", "10000");
     env_default("GCM_FIFO_SEGMENT", "0x8000");
@@ -454,6 +481,22 @@ static void title_environment(void)
     env_default("SPU_MFC_LOOKUP_CACHE", "1");
     env_default("GCM_FLIPCOUNT", "1");
     env_default("GOW3_WATCHDOG", "20,45,90,150,240");
+    env_default("GOW3_PROF", "1,30");
+    env_default("SPU_INTERP_STATS", "30");   /* which SPU code runs in the interpreter */
+    env_default("SPU_PROF", "30");           /* 29a: [sprof] SPU-side host threads (spu_prof.h) */
+    /* 29b: SPURS_POLL_CUR (poll answers wklCurrentId) is off: the 30th run showed
+     * the same fps with it and more host CPU spent in the Little worker. */
+    env_default("VDEC_PICLOG", "1");         /* 30a: placeholder pictures handed out vs AUs */
+    env_default("SPU_FLOATFIX_STATS", "1");  /* 38a: why float lanes fall to the cold scalar fix-ups (prints every 2^24) */
+    /* 50b removed (52): GOW3_NO_COLORGRADE=1 hung the 41st run at 51 s (PPU stuck at lr 0x26D3D0). */
+    env_default("GOW3_LUT_CACHE", "1");      /* 52b: cache of the grading LUT call (rjm_42d900 0x6E5C -> 0x6860), self-checked every 128 hits */
+    env_default("GOW3_LUT_DIAG", "1");       /* 52b: [lutc] hits/misses/bad every 10 s */
+    /* 56a: who waits for whom per frame (ps3_ftrace.h), 12 s from t=160 s, dumped to
+     * stderr as "@ft " lines for tools/ftrace_report.py. 1M spans = 32 MB. */
+    env_default("PS3_FTRACE", "160:12:-");
+    env_default("PS3_FTRACE_CAP", "1000000");
+    env_default("RSX_WALKER_PROF", "160:12");  /* 57a: sample the RSX FIFO walker thread (cellGcmSys.c), [wprof] lines */
+    env_default("VK_DRAW_BATCH", "1");         /* 58a: 45ª showed submit+wait per draw (~90% of the RSX thread); batch up to 512 draws per submission */
 #ifdef __SWITCH__
     /* The game's own vertex/fragment programs through glslang (HLSL -> SPIR-V),
      * with the translations kept on the SD card: 20-150 ms each on a desktop. */
@@ -490,8 +533,52 @@ static void* hang_watchdog(void* arg)
     }
     return nullptr;
 }
+/* GOW3_PROF="tid[,period_s]": every 2 ms, where guest thread `tid` is -- the
+ * HLE it is inside, else its last direct-call lr -- and every period the top
+ * 12 places with their share of the samples. */
+extern "C" uint32_t ppu_guest_lr_of(unsigned tid);
+static void* guest_sampler(void* arg)
+{
+    const char* spec = (const char*)arg;
+    const unsigned tid = (unsigned)atoi(spec);
+    const char* c = strchr(spec, ',');
+    const int period = c ? atoi(c + 1) : 30;
+    enum { SLOTS = 512 };
+    static uintptr_t key[SLOTS]; static unsigned hits[SLOTS]; static unsigned char is_hle[SLOTS];
+    for (;;) {
+        memset(hits, 0, sizeof hits); memset(key, 0, sizeof key);
+        unsigned total = 0;
+        const int n = period * 500;
+        for (int s = 0; s < n; s++) {
+            usleep(2000);
+            const char* h = tid < 64 ? g_hle_inflight[tid] : nullptr;
+            const uintptr_t k = h ? (uintptr_t)h : (uintptr_t)ppu_guest_lr_of(tid);
+            if (!k) continue;
+            unsigned i = (unsigned)((k * 2654435761u) >> 7) % SLOTS;
+            for (unsigned p = 0; p < SLOTS; p++, i = (i + 1) % SLOTS)
+                if (!key[i] || key[i] == k) break;
+            if (key[i] && key[i] != k) continue;   /* table full */
+            key[i] = k; is_hle[i] = h != nullptr; hits[i]++; total++;
+        }
+        fprintf(stderr, "[prof] tid %u, %u samples in %ds:\n", tid, total, period);
+        for (int r = 0; r < 12 && total; r++) {
+            unsigned best = 0, bi = 0;
+            for (unsigned i = 0; i < SLOTS; i++) if (hits[i] > best) { best = hits[i]; bi = i; }
+            if (!best) break;
+            if (is_hle[bi]) fprintf(stderr, "[prof]   %5.1f%%  in %s\n", 100.0 * best / total, (const char*)key[bi]);
+            else            fprintf(stderr, "[prof]   %5.1f%%  lr=0x%08X\n", 100.0 * best / total, (unsigned)key[bi]);
+            hits[bi] = 0;
+        }
+        fflush(stderr);
+    }
+    return nullptr;
+}
 static void hang_watchdog_start(void)
 {
+    if (const char* ps = getenv("GOW3_PROF")) if (*ps) {
+        pthread_t pt;
+        if (pthread_create(&pt, nullptr, guest_sampler, (void*)ps) == 0) pthread_detach(pt);
+    }
     const char* spec = getenv("GOW3_WATCHDOG");
     if (!spec || !*spec) return;
     pthread_t th;
@@ -534,6 +621,34 @@ int main(int argc, char** argv)
     if (!entry) {
         fprintf(stderr, "ERROR: could not load %s\n", argv[1]);
         return 1;
+    }
+
+    /* 50a: RPCS3 "Disable MLAA" v3.0 for GoW3 1.00 (illusion, ZEROx): the
+     * title's MLAA switch is the byte at 0x52BF2F (1 -> 0), and the bl at
+     * 0x231248 (func_00230DC4, lr 0x0023124C) is skipped in the lifted code
+     * through g_gow3_disable_mlaa. GOW3_NO_MLAA=0 keeps MLAA for the A/B. */
+    {
+        const char* e = getenv("GOW3_NO_MLAA");
+        const int want = e ? atoi(e) : 1;
+        const uint8_t cur = vm_read8(0x52BF2F);
+        if (want && cur == 1) {
+            vm_write8(0x52BF2F, 0);
+            g_gow3_disable_mlaa = 1;
+            printf("[patch] Disable MLAA: on (0x52BF2F 1->0, bl 0x231248 skipped)\n");
+        } else {
+            printf("[patch] Disable MLAA: off (want=%d, byte 0x52BF2F=%u)\n", want, cur);
+        }
+        /* RPCS3 "Disable Color Grading (Speedboost)" (illusion), 1.00 and 1.03:
+         * byte 0x52BDA3 1 -> 0. rjm_42d900 (Little, 0x4FA8: lerp, 3x4 matrix,
+         * clamp, pow, RGBA8 pack) looks like the grading LUT. Off by default. */
+        const char* g = getenv("GOW3_NO_COLORGRADE");
+        const uint8_t gc = vm_read8(0x52BDA3);
+        if (g && atoi(g) && gc == 1) {
+            vm_write8(0x52BDA3, 0);
+            printf("[patch] Disable Color Grading: on (0x52BDA3 1->0)\n");
+        } else {
+            printf("[patch] Disable Color Grading: off (byte 0x52BDA3=%u)\n", gc);
+        }
     }
 
     derive_vfs_root(argv[1]);

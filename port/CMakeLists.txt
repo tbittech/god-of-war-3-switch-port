@@ -99,6 +99,10 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # different reason. add_subdirectory hands all of that over with the target.
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
                  EXCLUDE_FROM_ALL)
+# 57a: frame records in the runtime so RSX_WALKER_PROF can walk the RSX thread's stack.
+if(NOT MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer)
+endif()
 
 # ---- GoW3 -> Switch: glslang (HLSL -> SPIR-V) para los shaders del juego ----
 # Fuente: glslang 11.0.0 de kof2002um-nx, compilado aca con HLSL (KOF lo compila sin).
@@ -215,6 +219,14 @@ elseif(PORT_ENABLE_SPU)
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
         # Generated beside the lift; each is present only once its generator
         # has been run, so each is included only if it is actually here.
+        # WWS jobmods relocatables (tools/lift_reloc_jobmods.py, --reloc a base 0x4000),
+        # registrados por reloc_register.c (tools/register_reloc_jobmods.py).
+        file(GLOB SPU_RELOC_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/reloc/*/spu_recomp.c")
+        if(SPU_RELOC_LIFTED AND EXISTS "${SPU_DIR}/reloc_register.c")
+            list(LENGTH SPU_RELOC_LIFTED SPU_RELOC_COUNT)
+            message(STATUS "Reloc jobmods:   ${SPU_RELOC_COUNT}")
+            list(APPEND SPU_SOURCES ${SPU_RELOC_LIFTED} "${SPU_DIR}/reloc_register.c")
+        endif()
         foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c wwspm_register.c)
             if(EXISTS "${SPU_DIR}/${gen}")
                 list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
@@ -245,10 +257,18 @@ add_executable(${PROJECT_NAME}
 #   -O2                 -- the target-wide -O1 exists for the huge PPU TUs; the
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
+# 38b: SPU_LS_NO_DIAG (rigaz29/ps3recomp c0925006): the lifted SPU code's lqd/stqd lose the
+# LS diagnostics gate (Ascension-R: RenderJobs -7.7%, EDGE -10.5%). The interpreter and the
+# runtime keep theirs. -DGOW3_SPU_LS_DIAG=ON brings it back for SPU_LS_WATCH/SPU_SMC_WATCH.
+option(GOW3_SPU_LS_DIAG "LS diagnostics gate in the lifted SPU code" OFF)
+set(GOW3_SPU_DEFS SPU_USE_DISPATCH_MT)
+if(NOT GOW3_SPU_LS_DIAG)
+    list(APPEND GOW3_SPU_DEFS SPU_LS_NO_DIAG)
+endif()
 if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
-        COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
+        COMPILE_DEFINITIONS "${GOW3_SPU_DEFS}")
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
     endif()
@@ -379,6 +399,9 @@ endif()
 if(GOW3_NX)
     # Directo en el ejecutable: pisa simbolos weak de libnx (no puede ir en la .a).
     target_sources(${PROJECT_NAME} PRIVATE "${NX_DIR}/compat/nx_exception.cpp")
+    # Reparte los hilos nuevos entre los nucleos 0-2 (libnx los crea todos en el 0).
+    target_sources(${PROJECT_NAME} PRIVATE "${NX_DIR}/compat/nx_thread_cores.c")
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=pthread_create")
     if(GOW3_NX_VULKAN)
         # libvulkan.a por ruta completa y dos veces (rescaneo del archivo), como rexglue_switch.cmake de KOF.
         target_sources(${PROJECT_NAME} PRIVATE "${NX_DIR}/compat/nx_elf_stubs.c")
